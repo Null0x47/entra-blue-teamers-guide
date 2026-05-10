@@ -38,6 +38,7 @@ Scope: identity-layer attacks against Entra. Not endpoint, not network, not work
 17. [Incident response runbooks](#17-incident-response-runbooks)
 18. [Tenant hardening baseline](#18-tenant-hardening-baseline)
 19. [Linkable Token Identifiers](#19-linkable-token-identifiers)
+20. [Microsoft Graph activity logs and the legacy AAD Graph](#20-microsoft-graph-activity-logs-and-the-legacy-aad-graph)
 
 ---
 
@@ -2096,6 +2097,216 @@ A few practical implications for the detections elsewhere in this guide:
 - The §4 Azure Portal worked example — those 20+ log rows for one user click — share one `SessionId` if the user authenticated once and stayed in CAE-bound territory. Replace your old "join on UPN + time window" with `SessionId` for cleaner reconstructions.
 - §6 OAuth phishing investigation: when triaging a `Consent to application` audit event, you currently can't pivot back to a session via SID (audit logs don't carry it yet). Pivot via UPN + time window to the `SigninLogs` row that preceded the consent, then use *that* row's `SessionId` to chase what the malicious app did with its newly-acquired tokens.
 - §13 incident response runbook for compromised account: after revoking sessions, use the SID of the suspect sign-in to enumerate exactly what happened during it. This is where LTI most cleanly closes a gap that used to take hours of correlation work.
+
+---
+
+## 20. Microsoft Graph activity logs and the legacy AAD Graph
+
+Sign-in logs tell you *who got a token*. They don't tell you *what they did with it*. For that, you need the Graph activity logs — the audit trail of every HTTP request the Graph service processed for your tenant. This is the layer where exfiltration, reconnaissance, and persistence operations actually happen, and skipping it means you're investigating attacks blind to their second half.
+
+There are two Graph endpoints, and therefore two activity log tables.
+
+### The two Graph endpoints
+
+**`graph.microsoft.com` — Microsoft Graph.** The modern, supported, actively-developed API. Everything Microsoft has built since ~2017 lives here: M365 services, Azure AD/Entra management, Defender XDR, Teams, Intune. New features ship here first and often only here. Modern SDKs (`Microsoft.Graph` PowerShell, `microsoft-graph-sdk-python`, the `@azure/msal-*` JS libraries) all target this endpoint.
+
+**`graph.windows.net` — Azure AD Graph (AAD Graph).** The legacy API. Microsoft has been deprecating it since 2019 — but it still works, and that "still works" is the problem. The classic `AzureAD` and `MSOnline` PowerShell modules talk to AAD Graph directly. Some older SaaS integrations still call it. Some Microsoft-internal tools historically called it. And — crucially — for years it had **no per-request audit logging**. Attackers learned this. AAD Graph became the defender's blind spot, and red-team tooling like ROADrecon explicitly preferred it because of that.
+
+That changed in late 2025: `AADGraphActivityLogs` started flowing into Log Analytics workspaces that had enabled the diagnostic setting. Many tenants enabled it in May 2025 and saw nothing for ~6 months — then suddenly data appeared. If you enabled this and never came back to check, **check now**, because attacks that were invisible during the gap are visible going forward.
+
+### The two log tables
+
+Both tables capture the same conceptual thing — an HTTP request to Graph — but with slightly different schemas because Microsoft's two log pipelines were built years apart by different teams.
+
+| Aspect | `MicrosoftGraphActivityLogs` | `AADGraphActivityLogs` |
+|---|---|---|
+| Endpoint | `graph.microsoft.com` | `graph.windows.net` |
+| Status | Modern, GA since late 2023 | Legacy, data flowing since late 2025 |
+| Volume | Very high — every Graph SDK call lands here | Lower (and shrinking as apps migrate), but high per-attacker-tool because legacy attacker tooling concentrates here |
+| Caller IP field | `IPAddress` | `CallerIpAddress` |
+| App identifier | `AppId` | `AppId` |
+| User identifier | `UserId` | `UserId` |
+| Service principal identifier | `ServicePrincipalId` | `ServicePrincipalId` |
+| Scopes/roles in token | `Roles` (array) | `Roles` (array) |
+| Request URI | `RequestUri` | `RequestUri` |
+| HTTP method | `RequestMethod` | `RequestMethod` |
+| Response code | `ResponseStatusCode` | `ResponseStatusCode` |
+| Correlation back to sign-in | `SignInActivityId` (joins to `UniqueTokenIdentifier`) | `UniqueTokenIdentifier` (with `==` padding quirk — see §19) |
+| Sub-request grouping | `OperationId` (groups `$batch` children) | `OperationId` |
+
+The naming inconsistency on `IPAddress` vs `CallerIpAddress` is real and bites people writing union queries across the two tables. Always normalize when joining:
+
+```kql
+union 
+    (MicrosoftGraphActivityLogs | extend SourceIp = IPAddress),
+    (AADGraphActivityLogs       | extend SourceIp = CallerIpAddress)
+| project TimeGenerated, SourceIp, AppId, UserId, RequestUri, RequestMethod, ResponseStatusCode
+```
+
+Without that extension, half your data has empty IPs and you don't notice until the detection misfires.
+
+### Reading a Graph activity log row
+
+A typical row contains:
+
+- **Who** — `AppId` (the app that made the call), `UserId` (the user the token was issued for, if delegated), `ServicePrincipalId` (the SP, if app-only).
+- **What** — `RequestMethod` + `RequestUri`. `GET https://graph.microsoft.com/v1.0/users` is "list all users." `POST https://graph.microsoft.com/v1.0/applications/{id}/addPassword` is "add a credential to that app" (the persistence move from §13).
+- **With what authority** — `Roles` array contains the scopes/permissions that were in the access token. This tells you *what the token was capable of*, not just *what it did*. An app calling `/me` with `Directory.ReadWrite.All` in its `Roles` array is a misconfigured app — the call was benign, the *token* is over-privileged.
+- **Result** — `ResponseStatusCode`. 200/201/204 = success. 401 = bad token. 403 = token valid but lacks the required role. 429 = rate limited. 5xx = Graph itself errored.
+- **Stitching back** — `SignInActivityId` joins to `UniqueTokenIdentifier` in the sign-in tables, so you can pivot a Graph call back to the exact sign-in event that produced its token.
+
+The `RequestUri` column is the most information-rich and the most painful to query. It's a full URL string, often very long (delta tokens, `$filter` expressions, OData query options). Searching it with `has` or `contains` works but is slow and prone to false positives. The standard pattern is to parse it once with `parse_url()` and project a normalized path:
+
+```kql
+MicrosoftGraphActivityLogs
+| extend Path = tostring(parse_url(RequestUri).Path)
+| extend NormalizedPath = replace_string(replace_string(Path, "v1.0/", ""), "beta/", "")
+| extend Resource = tostring(split(NormalizedPath, "/")[2])
+| project TimeGenerated, AppId, UserId, RequestMethod, NormalizedPath, Resource, ResponseStatusCode
+```
+
+`Resource` (the third path segment) gives you the high-level Graph resource — `users`, `groups`, `applications`, `directoryRoles`, `serviceprincipals`, `me`, `messages`, `drives`. This is what you summarize on for behavioral analysis.
+
+### `$batch` calls and `OperationId`
+
+This is the single most important thing to internalize about Graph activity logs, because if you don't, your detections will undercount attacker activity by 90%+.
+
+The Graph API supports a `$batch` endpoint that lets a client send up to 20 sub-requests in a single HTTP POST and get up to 20 responses back. Microsoft Graph SDKs use it aggressively for performance — modern clients almost never make individual calls when they can batch. Attacker tooling does too, because batching is faster.
+
+Here's the deceptive part: the Graph activity logs **record the parent `$batch` POST as its own row, and each sub-request as its own row**. The parent has a `RequestUri` of `https://graph.microsoft.com/v1.0/$batch` (or `/beta/$batch`), `RequestMethod` of `POST`, and tells you nothing about what was actually requested. The children have the real `RequestMethod` (often `GET`, `PATCH`, `DELETE`) and the real `RequestUri` (the actual API endpoints).
+
+If you write a detection like `where RequestUri has "/users"`, you find the children but lose context — you can't see they were part of a batch, can't see the other batched operations they ran alongside, and can't easily attribute them to one logical client call. If you filter on `RequestMethod == "POST"` you find the parent batch but miss what's inside it.
+
+**The link between parent and children is `OperationId`**. All sub-requests of one `$batch` POST share the parent's `OperationId`. This is the canonical join pattern (originally documented by Cloudbrothers, the standard reference):
+
+```kql
+// Parent $batch POSTs
+let batches = MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(1d)
+| where RequestMethod == "POST" and RequestUri endswith "/$batch"
+| project OperationId, BatchTime = TimeGenerated, BatchAppId = AppId, BatchUserId = UserId,
+          BatchIp = IPAddress;
+// Children — every other call
+let children = MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(1d)
+| where not(RequestMethod == "POST" and RequestUri endswith "/$batch")
+| project-rename ChildRequestUri = RequestUri, ChildRequestMethod = RequestMethod;
+batches
+| join kind=inner children on OperationId
+| project BatchTime, OperationId, BatchAppId, BatchUserId, BatchIp,
+          ChildRequestMethod, ChildRequestUri, ResponseStatusCode
+| sort by BatchTime asc, OperationId
+```
+
+This gives you, for each `$batch`, the full list of sub-operations it actually performed. Now you can reason about it like a single client action — "this batch read 17 users and updated one group" instead of 18 unrelated rows.
+
+Two practical implications:
+
+1. **Detection rules that look at `RequestUri`** should be aware that the same operation can appear either as a standalone call or as a sub-request of a `$batch`. Filter for both patterns. A query that only catches `where RequestUri has "/applications/" and RequestMethod == "PATCH"` will miss the same operation when it arrives via `$batch`.
+2. **Counting unique attacker operations** by `count()` over `MicrosoftGraphActivityLogs` rows over-counts when batches are involved (parent + children all count) and undercounts the *intent* (one logical batch is one decision the attacker made, not 20). For behavioral analysis use `count_distinct(OperationId)` for "logical operations" and the row count for "raw API calls."
+
+### High-value detection patterns
+
+The Graph activity logs are where post-compromise behavior becomes visible. A non-exhaustive list of the patterns worth building rules on:
+
+**Mass mailbox enumeration via Graph.** A token with `Mail.Read` reading every user's mailbox in sequence is the OAuth phishing payoff path. The KQL fingerprint:
+
+```kql
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(7d)
+| where RequestMethod == "GET"
+| where RequestUri matches regex @"/users/[^/]+/messages"
+| where ResponseStatusCode in (200, 206)
+| summarize MailboxesAccessed = dcount(extract(@"/users/([^/]+)/messages", 1, RequestUri)),
+            CallCount = count(),
+            FirstSeen = min(TimeGenerated),
+            LastSeen = max(TimeGenerated)
+    by AppId, UserId, IPAddress
+| where MailboxesAccessed > 5
+| sort by MailboxesAccessed desc
+```
+
+Tune the `> 5` threshold to your environment. A single user reading their own mailbox is normal (one mailbox); an OAuth-phished app reading 50 mailboxes in 10 minutes isn't.
+
+**Directory enumeration as reconnaissance.** Attacker tooling like ROADrecon, AzureHound, AADInternals, BloodHound's Azure collector all hit a recognizable shopping list of endpoints — `/users`, `/groups`, `/serviceprincipals`, `/applications`, `/directoryRoles`, `/policies`, `/conditionalAccess/policies`, `/domains`. Any one is normal; the *combination*, in tight time succession, from one app/user, is reconnaissance:
+
+```kql
+let recon_paths = dynamic([
+    "/users", "/groups", "/serviceprincipals", "/applications",
+    "/directoryroles", "/policies/conditionalaccesspolicies",
+    "/domains", "/organization", "/directoryobjects"
+]);
+union 
+    (MicrosoftGraphActivityLogs | extend SourceIp = IPAddress),
+    (AADGraphActivityLogs       | extend SourceIp = CallerIpAddress)
+| where TimeGenerated > ago(1d)
+| where RequestMethod == "GET"
+| extend NormalizedPath = tolower(replace_string(replace_string(
+    tostring(parse_url(RequestUri).Path), "v1.0/", ""), "beta/", ""))
+| where NormalizedPath has_any (recon_paths)
+| extend HitPath = tostring(array_iff(NormalizedPath has_any (recon_paths), NormalizedPath, ""))
+| summarize DistinctPaths = dcount(NormalizedPath),
+            PathList = make_set(NormalizedPath, 20),
+            CallCount = count(),
+            FirstSeen = min(TimeGenerated)
+    by AppId, UserId, ServicePrincipalId, SourceIp
+| where DistinctPaths >= 5
+| sort by DistinctPaths desc
+```
+
+Catches tools that systematically enumerate the directory regardless of whether they prefer Graph, AAD Graph, or both. The Invictus IR research notes that some attacker tools have signature User-Agents (e.g., `python` + `aiohttp` for ROADrecon) — adding a `UserAgent` filter sharpens this further but at the cost of evading attackers who change their UA.
+
+**The `aiohttp` / known-tool fingerprint specifically:**
+
+```kql
+AADGraphActivityLogs
+| where TimeGenerated > ago(7d)
+| where UserAgent has_any ("aiohttp", "python-requests", "ROADtools")
+| summarize CallCount = count(), DistinctPaths = dcount(RequestUri)
+    by CallerIpAddress, AppId, UserAgent
+| sort by CallCount desc
+```
+
+A legitimate Python-based admin tool occasionally hits Graph from `aiohttp` — Datadog's app, some Microsoft-owned tooling. Allowlist the legitimate ones (by `AppId`) and the rest of the signal is high-fidelity.
+
+**App permissions never used — and now suddenly used.** The §15 hunt query for "stale apps that have never been used" works against sign-in logs but is sharper against Graph activity logs, because `Roles` tells you the *granted scopes that were exercised* on each call. An app consented to `Mail.ReadWrite` but never seen reading mail in 90 days, suddenly reading mail today, is a strong signal. Build a baseline of which scopes each app actually exercises and alert on first-use of dormant scopes.
+
+**Privileged role assignment via Graph.** The Graph endpoint `POST /roleManagement/directory/roleAssignments` adds someone to a directory role. Worth alerting on unconditionally:
+
+```kql
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(1d)
+| where RequestMethod == "POST"
+| where RequestUri has "/roleManagement/directory/roleAssignments"
+| where ResponseStatusCode in (201, 204)
+| project TimeGenerated, AppId, UserId, ServicePrincipalId, IPAddress, RequestUri, SignInActivityId
+```
+
+Pivot on `SignInActivityId` → join to `UniqueTokenIdentifier` in sign-in logs → understand the session that did this.
+
+### Caveats
+
+A few things to know before you build production detections:
+
+**Volume and cost.** `MicrosoftGraphActivityLogs` is *very* high volume in any active tenant — easily multiple GB/day for a mid-sized org. Sentinel ingestion charges apply. Microsoft's "Defender XDR auxiliary table" (`GraphApiAuditEvents`, GA in 2025) covers most of the same data at no ingest cost, but with 30-day retention vs. whatever you set in Sentinel. Many tenants now use `GraphApiAuditEvents` for the bulk and keep `MicrosoftGraphActivityLogs` ingestion limited to high-value subsets via diagnostic settings filters or table-level filters.
+
+**Coverage gaps.** Microsoft's own docs note: "Activity logs from Microsoft applications might not all have matching sign-in log entries." First-party Microsoft services sometimes generate Graph activity without a corresponding `SigninLogs` entry — meaning your "join sign-in to Graph activity" queries will have unmatched rows that are *not* attacker behavior. This is consistent with the broader pattern that some Microsoft-internal flows produce Graph activity outside the normal token-issuance path.
+
+**Some tenant operations bypass Graph entirely.** Configuration changes done through the Azure Portal admin pages don't always go through Graph — some hit private Microsoft APIs that don't appear in `MicrosoftGraphActivityLogs` at all. They appear in `AuditLogs` (the directory audit) but with `CorrelationId` joins that don't always match. The Cloudbrothers research found ~73 audit events in their test tenant with no matching Graph activity log entry. Implication: don't treat absence-from-Graph-logs as proof an action wasn't taken; pair Graph activity logs with `AuditLogs` for full coverage.
+
+**`ClientRequestId` as the better correlation key.** Cloudbrothers' research found that `ClientRequestId` (set by the client, propagated through Graph) is a more reliable correlation key than `OperationId` or `RequestId` for joining `AuditLogs` to `MicrosoftGraphActivityLogs`. `OperationId` is what groups `$batch` children together (use that for batch joins), but for joining a single Graph call to its corresponding audit event, `ClientRequestId` is the better anchor.
+
+**Schema evolution.** Microsoft has changed column names mid-flight before — `IpAddress` was renamed to `IPAddress` between preview and GA on the modern table, breaking everyone's saved queries. Treat schemas as Microsoft-can-change-anytime and check column names if a query suddenly returns empty.
+
+### How this connects to the rest of the guide
+
+A few practical ties back to earlier sections:
+
+- The **OAuth phishing investigation in §11** ends with "now hunt the malicious app's activity." This is the table you hunt in. Pivot on the attacker's `AppId` in `MicrosoftGraphActivityLogs` to see exactly which mailboxes/files were accessed, with what scopes, from what IP. The `Roles` array on each call tells you which scopes the attacker's token actually exercised.
+- **Service principal credential abuse from §13** is most cleanly investigated by joining `AuditLogs` (the credential add) to `MicrosoftGraphActivityLogs` (the subsequent activity) on `AppId` — the credential add audit row gives you the time anchor; the Graph activity log shows what the new credential's tokens were used for.
+- **Linkable Token Identifiers from §19** join Graph activity logs to sign-in logs via `SignInActivityId` ↔ `UniqueTokenIdentifier`. This is the cleanest way to scope a session-wide investigation including its API-layer activity. Watch out for the `==` padding quirk on the AAD Graph table.
+
+The bottom line: sign-in logs are where you discover compromise; Graph activity logs are where you assess its impact. A defender who only watches sign-in logs sees attackers walk in the door; a defender who also watches Graph activity logs sees what they took on the way out.
 
 ---
 
