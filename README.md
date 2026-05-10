@@ -10,6 +10,27 @@ If you already know the protocols, you can jump to Part II at §6. If you only k
 
 Scope: identity-layer attacks against Entra. Not endpoint, not network, not workload runtime. Where those overlap (PRT theft, AiTM, Conditional Access bypasses) we'll touch them, but the core is what's visible in `SigninLogs`, `AADNonInteractiveUserSignInLogs`, `AADServicePrincipalSignInLogs`, and `AuditLogs`.
 
+> **A note on data sources.** Throughout this guide, KQL queries and log field names use the **Sentinel / Log Analytics** schema — i.e., logs exported from Entra ID's *Diagnostic settings* into a Log Analytics workspace. These are the tables most defenders run their hunts and detections against (`SigninLogs`, `AADNonInteractiveUserSignInLogs`, `AADServicePrincipalSignInLogs`, `AuditLogs`, `MicrosoftGraphActivityLogs`, `AADGraphActivityLogs`).
+>
+> **Microsoft Defender XDR** has a parallel set of advanced-hunting tables — `EntraIdSignInEvents` and `EntraIdSpnSignInEvents` (which replaced the preview-era `AADSignInEventsBeta` and `AADSpnSignInEventsBeta` on 9 December 2025). The data is largely the same — these are Defender XDR's view of the same underlying Entra sign-in stream — but **the column names are different**, and you can't paste a Sentinel query into Defender XDR's hunting console (or vice versa) without translation. Some of the most common mappings to keep in your head:
+>
+> | Sentinel / Log Analytics | Defender XDR |
+> |---|---|
+> | `TimeGenerated` | `Timestamp` |
+> | `AppId` | `ApplicationId` |
+> | `AppDisplayName` | `Application` |
+> | `UserId` | `AccountObjectId` |
+> | `UserPrincipalName` | `AccountUpn` |
+> | `UserDisplayName` | `AccountDisplayName` |
+> | `ResultType` | `ErrorCode` |
+> | `IsInteractive` (boolean) | `LogonType` (`interactiveUser`/`nonInteractiveUser`) |
+> | `Location.countryOrRegion` | `Country` |
+> | `CorrelationId` | `ReportId` |
+> | `OriginalRequestId` | `RequestId` |
+> | `IPAddress`, `SessionId`, `ClientAppUsed` | (same names) |
+>
+> The detection logic, attack patterns, log-stitching workflows, and investigative principles in this guide all apply equally to the Defender XDR tables — only the field names and table names change. If you're working in `security.microsoft.com`'s advanced hunting rather than Sentinel's Log Analytics, translate as you read. (And note one capability gap: Defender XDR's `EntraIdSignInEvents` requires Entra ID P2; Sentinel ingestion of `SigninLogs` does not.)
+
 ---
 
 ## Table of contents
