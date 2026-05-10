@@ -324,7 +324,9 @@ The give-aways: `authenticationProtocol: "oAuth2"`, `incomingTokenType: "none"` 
 
 ## 3. Refresh Token Flow
 
-Not really a "flow" you initiate from scratch — it's how you renew tokens after any user-delegated flow. A single refresh token can mint access tokens for *any resource* the user has consented to. This is what makes RT theft (or OAuth phishing for an RT) so much worse than AT theft.
+Not really a "flow" you initiate from scratch — it's how you renew tokens after any **user-delegated** flow (auth code + PKCE, hybrid, ROPC, device code). A single refresh token can mint access tokens for *any resource* the user has consented to. This is what makes RT theft (or OAuth phishing for an RT) so much worse than AT theft.
+
+> **Client credentials does not produce refresh tokens.** This is a frequent misconception — daemon apps using `grant_type=client_credentials` get an access token only, no refresh token. Microsoft's own docs are explicit: "refresh tokens will never be granted with this flow as client_id and client_secret (which would be required to obtain a refresh token) can be used to obtain an access token instead." Structurally it makes sense — refresh tokens exist so you don't have to re-prompt a *user* for credentials. A daemon always has its credential available, so it just calls `/token` again with `grant_type=client_credentials` when its access token expires. This also means the `offline_access` scope has no effect in client-credentials requests, and any code that tries to redeem a "refresh token" issued to a service principal is doing something wrong (almost always: someone confused which flow they used, or copy-pasted user-flow code into a daemon). For defenders: if you see a sign-in row in `AADServicePrincipalSignInLogs` with `IncomingTokenType: "refreshToken"`, that's anomalous and worth investigating — it shouldn't happen for a properly-configured daemon.
 
 ### Pure Python
 
