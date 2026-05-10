@@ -892,17 +892,61 @@ union SigninLogs, AADNonInteractiveUserSignInLogs
 
 ## 9. Continuous Access Evaluation for defenders
 
-CAE issues longer-lived (~28 hour) access tokens against participating resources, but they're revocable mid-flight. When the user's risk goes high, password resets, account disables, or IP moves outside trusted locations, the resource API rejects the token immediately and the client gets a `claims_challenge` response.
+CAE is one of those features where the marketing description ("real-time token revocation!") undersells the operational complexity. For defenders the key thing to understand is that CAE isn't a switch you flip — it's a **negotiation between three parties**, all of which have to opt in independently, and which can silently fail in ways that look fine in the portal but leave you with no actual revocation.
 
-### What this means for detection
+### How CAE actually works
 
-CAE is mostly a defense win — revocation is fast. But it changes how sessions look in the logs:
+The core trade-off CAE makes: instead of issuing short-lived (~75 minute) access tokens that clients constantly renew, Entra issues **long-lived tokens** — up to **28 hours** for users, **24 hours** for workload identities — that the resource API can **reject mid-flight** when something changes. Fewer token round-trips, near-real-time revocation, better resilience and security at once. (For workload identities specifically, *managed identities aren't supported* for CAE — only service principals for line-of-business apps. That's a real gap.)
 
-- A single user can have multiple `SigninLogs` rows in an hour as CAE re-auths happen. This is **normal**, not anomalous.
-- The token's `Is CAE Token` field (in `AuthenticationProcessingDetails`) tells you if revocation will actually work for that token.
-- Microsoft 365 services (Graph, Exchange, SharePoint, Teams) and ARM are CAE-enabled. Custom APIs are not unless you built it. Storage data plane and Key Vault data plane are not.
+The negotiation has three required parties:
 
-### KQL: CAE coverage check
+**1. The resource API has to be CAE-enabled.** Microsoft has rolled this out gradually since 2020 — Microsoft Graph, Exchange Online, SharePoint Online, Teams, ARM. Custom APIs you build don't get CAE unless you implement the protocol on the resource side, which almost no one has. Storage data plane and Key Vault data plane are not CAE-enabled. This is the gotcha most people miss: CAE isn't a tenant setting that just turns on for everything.
+
+**2. The client has to declare `cp1` in its client capabilities.** This is a string the app sends in the token request that means "I understand the claims challenge protocol, you can give me a long-lived token, I'll handle 401 responses correctly." MSAL libraries set this automatically when configured to. The authoritative way to verify a token is CAE-capable is to check for `"xms_cc": ["CP1"]` in the issued access token's claims.
+
+**3. The session has to be eligible.** No policy blocking it, the user's session was issued with CAE awareness, the client connects in a way that supports the revocation signal path. **Guest user accounts are not supported by CAE** — that's a notable defender-relevant exclusion.
+
+If all three line up, the access token gets a long lifetime and a `xms_cc: ["CP1"]` claim. If any one of them doesn't, you get a normal ~75-minute token with no CAE — even if the resource and client are both modern.
+
+### What revocation actually responds to
+
+CAE doesn't react to "anything." It reacts to a specific list of **critical events**:
+
+- User account deletion or disable.
+- User password change or reset.
+- MFA being enabled for the user.
+- Admin explicitly revoking refresh tokens (`Revoke-MgUserSignInSession`).
+- User flagged as high-risk by Identity Protection.
+- Token's IP changing outside the trusted IP ranges defined in a Conditional Access location policy (when "Strict Location Enforcement" is enabled).
+
+Two important latency notes from Microsoft's own docs: critical events propagate in **near-real-time but with up to 15-minute latency** because of event distribution time. **IP location enforcement is instant.** So password resets and account disables protect within ~10 minutes; an attacker exfiltrating a stolen token from outside trusted IPs gets cut off the moment they make a request.
+
+### The claims challenge mechanic
+
+The actual revocation flow that defenders need to understand:
+
+1. Token gets revoked (one of the events above fires).
+2. Attacker (or legitimate user) makes an API call to a CAE-enabled resource with the now-stale token.
+3. Resource returns **HTTP 401** with a `WWW-Authenticate` header containing a base64-encoded `claims` directive — the *claims challenge*.
+4. CAE-capable client recognizes the challenge, calls `/token` again with the original refresh token plus the `claims` parameter.
+5. Entra reevaluates the user's current state, applies any new policies, and either issues a fresh token or forces interactive re-auth.
+
+The `WWW-Authenticate` header looks like this:
+
+```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer realm="", authorization_uri="https://login.microsoftonline.com/common/oauth2/authorize",
+                  error="insufficient_claims",
+                  claims="eyJhY2Nlc3NfdG9rZW4iOnsiYWNycyI6eyJlc3NlbnRpYWwiOnRydWUsInZhbHVlIjoiY3AxIn19fQ=="
+```
+
+The base64 `claims` value decodes to a JSON object describing what new claims the client needs to acquire. MSAL handles this transparently when the client app declares `cp1` capability; non-MSAL hand-rolled clients have to extract the claims value from the header and pass it to the next `/token` call as a `claims` parameter.
+
+### Verifying CAE is actually working in your tenant
+
+The "is CAE working" question has multiple layers. Each can fail independently.
+
+**Method 1 — Check the sign-in logs (most reliable, ground truth):**
 
 ```kql
 union SigninLogs, AADNonInteractiveUserSignInLogs
@@ -920,7 +964,49 @@ union SigninLogs, AADNonInteractiveUserSignInLogs
 | sort by Total desc
 ```
 
-If a CAE-eligible app/resource pair is showing 0% CAE, something is downgrading the session. Investigate.
+Each row is a (client app, resource API) pair with the CAE issuance rate. Patterns to expect:
+
+- Microsoft Graph + modern Microsoft apps (Teams, Outlook, Azure Portal, OneDrive sync) → close to 100% CAE.
+- ARM + Azure Portal / CLI / PowerShell → high CAE rate.
+- Exchange Online + Outlook → high CAE rate.
+- Custom APIs you build → 0%. Always. Unless you implemented CAE on the resource side.
+- Legacy apps using ROPC, device code, or implicit → 0% or sporadic.
+
+**If a CAE-eligible app/resource pair shows 0% CAE, something is downgrading the session.** Investigate the client — it's probably not declaring `cp1`.
+
+**Method 2 — Decode an actual access token:** paste it into [jwt.ms](https://jwt.ms), look for:
+
+- `xms_cc` containing `"CP1"` (or `"cp1"`) — the *client* declared CAE capability.
+- `exp - iat` lifetime: ~3600s = standard hour token (no CAE), ~86400s+ = long-lived CAE token.
+- `xms_ssm` (session management) — its presence indicates a session-bound, CAE-evaluable token.
+
+If you see `xms_cc: ["CP1"]` AND a 1-hour expiry, the client *asked* for CAE but the *resource* doesn't support it, so Entra issued a normal token. If `xms_cc` is missing entirely, the client never asked for CAE.
+
+**Method 3 — Check tenant CA policy.** Conditional Access → Session controls → Customize continuous access evaluation. Three options:
+
+- **Disable** — no CAE for anyone (don't pick this).
+- **Migrate** — default; CAE enabled for capable client/resource pairs.
+- **Strict Location Enforcement** — CAE additionally revokes when user IP changes outside trusted locations.
+
+Some tenants also have a *Strict Enforcement* mode that requires CAE-capable clients; non-CAE clients are blocked rather than falling back to short-lived tokens. Check your CA policy state to know which mode you're actually in.
+
+**Method 4 — Audit your own apps' client capabilities.** If you build apps that consume Microsoft APIs, decode their tokens and check `xms_cc`. For MSAL Python, the opt-in is `client_capabilities=["cp1"]` on the constructor. Modern Azure SDKs (`azure-identity`, etc.) set CP1 automatically when talking to ARM. Hand-rolled implementations against `/token` directly don't get CAE without explicitly requesting it.
+
+### What this means for detection logic
+
+CAE is mostly a defense win — revocation is fast — but it changes how sessions look in your logs in ways that trip up naive detections.
+
+**A single user can have multiple `SigninLogs` rows in an hour as CAE re-auths happen.** This is normal, not anomalous. A claims-challenge-driven re-auth produces a fresh interactive sign-in row even though the user didn't see a prompt. Detections counting "interactive sign-ins per user per hour" need to know this — multiple rows from one user in a CAE-enabled tenant doesn't mean repeated authentication attempts.
+
+**The famous "Is CAE Token: True on the sign-in but False on subsequent rows" gotcha.** Defenders see this and assume CAE broke. Usually what's happening is the SPA acquired a token for a non-CAE resource (Storage data plane, Key Vault data plane, your custom API) on top of a CAE-capable session — the *session* is still CAE, but that *particular access token* isn't, because the resource doesn't participate. Session-level and per-token CAE state are different things.
+
+**Detections shouldn't fire on claims-challenge re-auths.** When CAE revokes a token and the client re-authenticates via the claims challenge mechanic, the resulting `SigninLogs` row looks like a brand-new interactive sign-in. If your "user signed in from a new country" detection fires here without context, you'll alert on the user's perfectly normal post-revocation re-auth from their actual location. Filter for `IsCAEToken == "True"` AND check whether the prior token was revoked recently.
+
+**Strict Location Enforcement makes IP-based detections obsolete on CAE-eligible apps.** Once enforced, a token used outside trusted IPs is killed by the resource itself within seconds. Your "user signed in from anonymous proxy" detection is doing nothing the resource isn't already doing — except it fires after the fact, on the post-revocation re-auth, which is even more confusing. Re-scope IP-anomaly detections to non-CAE apps where this enforcement gap actually matters.
+
+### Practical recommendation
+
+If you're new to a tenant: run Method 1's KQL on day one. The output tells you which app/resource pairs are getting CAE and which aren't, and that's the map of "where revocation works fast" vs "where revocation depends on token expiry." That distinction drives a surprising amount of incident-response time-to-contain math — for non-CAE pairs, after revoking a session you're waiting up to ~75 minutes for active access tokens to die naturally. For CAE pairs, you're waiting ~10 minutes (the propagation latency) at most, and seconds for IP-based revocation. Knowing which apps fall into which category before an incident is what lets you give an honest containment-time estimate during one.
 
 ---
 
