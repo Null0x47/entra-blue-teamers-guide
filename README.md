@@ -92,7 +92,7 @@ Before the flows make sense, four ideas need to be solid.
 
 **The flows you'll see.** There are nine, varying by which endpoint, which client type, and what the client trades in. The next four sections walk through them.
 
-A note on the logs you'll see throughout Part I: each flow produces a specific row shape in Entra sign-in logs. The flow itself is most clearly identified by `authenticationProtocol` and `incomingTokenType` inside `authenticationProcessingDetails`. Memorize those two fields — Part II's detection logic is mostly built on them.
+A note on the logs you'll see throughout Part I: each flow produces a specific row shape in Entra sign-in logs. The two most useful fields for flow identification are `IncomingTokenType` (always populated, reliably distinguishes fresh auth vs refresh vs OBO vs primary refresh token) and `AuthenticationProtocol` (populated reliably for *non-OAuth* flows like SAML, device code, ROPC — and typically `"none"` for OAuth-family flows in production). Both appear as top-level columns in the Log Analytics `SigninLogs` table. Part II's detection logic leans on `IncomingTokenType` as the primary signal, with `AuthenticationProtocol` as a positive filter for the non-OAuth flows. See §7 for a calibration note based on real production telemetry.
 
 ---
 
@@ -209,38 +209,43 @@ The interactive row from the user's authentication looks like this. (One ceremon
 
 ```json
 {
-  "id": "8a4de8b5-095c-47d0-a96f-a75130c61d53",
-  "createdDateTime": "2026-05-08T09:14:22.443Z",
-  "userDisplayName": "Alice Anderson",
-  "userPrincipalName": "alice@contoso.onmicrosoft.com",
-  "userId": "9f8b7a6c-5d4e-3f2a-1b0c-9d8e7f6a5b4c",
-  "appId": "11111111-2222-3333-4444-555555555555",
-  "appDisplayName": "Contoso Internal Portal",
-  "ipAddress": "203.0.113.42",
-  "clientAppUsed": "Browser",
-  "correlationId": "c1a2b3d4-5e6f-7081-92a3-b4c5d6e7f809",
-  "conditionalAccessStatus": "success",
-  "isInteractive": true,
-  "tokenIssuerType": "AzureAD",
-  "resourceDisplayName": "Microsoft Graph",
-  "resourceId": "00000003-0000-0000-c000-000000000000",
-  "riskDetail": "none",
-  "riskLevelAggregated": "none",
-  "riskLevelDuringSignIn": "none",
-  "riskState": "none",
-  "riskEventTypes_v2": [],
-  "resourceTenantId": "your-tenant-id",
-  "homeTenantId": "your-tenant-id",
-  "crossTenantAccessType": "none",
-  "authenticationRequirement": "multiFactorAuthentication",
-  "incomingTokenType": "none",
-  "authenticationProtocol": "oAuth2",
-  "status": {
+  "TenantId": "your-tenant-id",
+  "TimeGenerated": "2026-05-08T09:14:22.443Z",
+  "Id": "8a4de8b5-095c-47d0-a96f-a75130c61d53",
+  "CreatedDateTime": "2026-05-08T09:14:22.443Z",
+  "UserDisplayName": "Alice Anderson",
+  "UserPrincipalName": "alice@contoso.onmicrosoft.com",
+  "UserId": "9f8b7a6c-5d4e-3f2a-1b0c-9d8e7f6a5b4c",
+  "AppId": "11111111-2222-3333-4444-555555555555",
+  "AppDisplayName": "Contoso Internal Portal",
+  "IPAddress": "203.0.113.42",
+  "ClientAppUsed": "Browser",
+  "CorrelationId": "c1a2b3d4-5e6f-7081-92a3-b4c5d6e7f809",
+  "ConditionalAccessStatus": "success",
+  "IsInteractive": true,
+  "TokenIssuerType": "AzureAD",
+  "ResourceDisplayName": "Microsoft Graph",
+  "ResourceIdentity": "00000003-0000-0000-c000-000000000000",
+  "RiskDetail": "none",
+  "RiskLevelAggregated": "none",
+  "RiskLevelDuringSignIn": "none",
+  "RiskState": "none",
+  "RiskEventTypes_V2": [],
+  "ResourceTenantId": "your-tenant-id",
+  "HomeTenantId": "your-tenant-id",
+  "CrossTenantAccessType": "none",
+  "AuthenticationRequirement": "multiFactorAuthentication",
+  "IncomingTokenType": "none",
+  "AuthenticationProtocol": "none",
+  "ResultType": "0",
+  "ResultSignature": "None",
+  "ResultDescription": "MFA requirement satisfied by claim in the token",
+  "Status": {
     "errorCode": 0,
     "failureReason": "Other.",
     "additionalDetails": "MFA requirement satisfied by claim in the token"
   },
-  "deviceDetail": {
+  "DeviceDetail": {
     "deviceId": "ab12cd34-ef56-7890-abcd-ef0123456789",
     "displayName": "ALICE-LAPTOP",
     "operatingSystem": "Windows 11",
@@ -249,13 +254,14 @@ The interactive row from the user's authentication looks like this. (One ceremon
     "isManaged": true,
     "trustType": "Azure AD joined"
   },
-  "location": {
+  "LocationDetails": {
     "city": "Amsterdam",
     "state": "North Holland",
     "countryOrRegion": "NL",
     "geoCoordinates": {"latitude": 52.3676, "longitude": 4.9041}
   },
-  "appliedConditionalAccessPolicies": [
+  "Location": "NL",
+  "ConditionalAccessPolicies": [
     {
       "id": "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9",
       "displayName": "Require MFA for all users",
@@ -274,7 +280,7 @@ The interactive row from the user's authentication looks like this. (One ceremon
       "conditionsNotSatisfied": 1
     }
   ],
-  "authenticationDetails": [
+  "AuthenticationDetails": [
     {
       "authenticationStepDateTime": "2026-05-08T09:14:21.901Z",
       "authenticationMethod": "Password",
@@ -292,24 +298,24 @@ The interactive row from the user's authentication looks like this. (One ceremon
       "authenticationStepRequirement": "Multifactor authentication"
     }
   ],
-  "authenticationProcessingDetails": [
+  "AuthenticationProcessingDetails": [
     {"key": "Login Hint Present", "value": "True"},
     {"key": "Is CAE Token", "value": "False"},
     {"key": "Root Site Id", "value": "00000000-0000-0000-0000-000000000000"},
     {"key": "Oauth Scope Info", "value": "[\"User.Read\",\"Mail.Read\",\"openid\",\"profile\",\"offline_access\"]"}
   ],
-  "networkLocationDetails": [
+  "NetworkLocationDetails": [
     {"networkType": "namedNetwork", "networkNames": ["Corp HQ"]}
   ],
-  "mfaDetail": {
+  "MfaDetail": {
     "authMethod": "Mobile app notification",
     "authDetail": "Microsoft Authenticator app"
   },
-  "tokenProtectionStatusDetails": {
+  "TokenProtectionStatusDetails": {
     "signInSessionStatus": "unbound",
     "signInSessionStatusCode": 0
   },
-  "sessionLifetimePolicies": [
+  "SessionLifetimePolicies": [
     {
       "expirationRequirement": "rememberMultifactorAuthenticationOnTrustedDevices",
       "policyId": null
@@ -318,7 +324,7 @@ The interactive row from the user's authentication looks like this. (One ceremon
 }
 ```
 
-The give-aways: `authenticationProtocol: "oAuth2"`, `incomingTokenType: "none"` (nothing was traded in — the user authenticated fresh), `clientAppUsed: "Browser"`, and the `Oauth Scope Info` entry showing `offline_access` was requested (so a refresh token was issued).
+The give-aways: `IncomingTokenType: "none"` (nothing was traded in — the user authenticated fresh), `IsInteractive: true`, `ClientAppUsed: "Browser"`, `AuthenticationProtocol: "none"` (which is what OAuth flows actually look like in production — see §7), and the `Oauth Scope Info` entry showing `offline_access` was requested (so a refresh token was issued).
 
 ---
 
@@ -362,32 +368,36 @@ Refresh redemptions show up in `AADNonInteractiveUserSignInLogs`. The `correlati
 
 ```json
 {
-  "id": "fb38ec24-9b6f-4a5e-bd11-3e2a9c7d4e51",
-  "createdDateTime": "2026-05-08T10:18:55.221Z",
-  "userDisplayName": "Alice Anderson",
-  "userPrincipalName": "alice@contoso.onmicrosoft.com",
-  "userId": "9f8b7a6c-5d4e-3f2a-1b0c-9d8e7f6a5b4c",
-  "appId": "11111111-2222-3333-4444-555555555555",
-  "appDisplayName": "Contoso Internal Portal",
-  "ipAddress": "203.0.113.42",
-  "clientAppUsed": "Mobile Apps and Desktop clients",
-  "correlationId": "9d8e7f6a-5b4c-3d2e-1f09-8a7b6c5d4e3f",
-  "conditionalAccessStatus": "success",
-  "isInteractive": false,
-  "tokenIssuerType": "AzureAD",
-  "resourceDisplayName": "Microsoft Graph",
-  "resourceId": "00000003-0000-0000-c000-000000000000",
-  "riskState": "none",
-  "riskDetail": "none",
-  "riskLevelAggregated": "none",
-  "authenticationRequirement": "singleFactorAuthentication",
-  "incomingTokenType": "primaryRefreshToken",
-  "authenticationProtocol": "oAuth2",
-  "status": {
+  "TenantId": "your-tenant-id",
+  "TimeGenerated": "2026-05-08T10:18:55.221Z",
+  "Id": "fb38ec24-9b6f-4a5e-bd11-3e2a9c7d4e51",
+  "CreatedDateTime": "2026-05-08T10:18:55.221Z",
+  "UserDisplayName": "Alice Anderson",
+  "UserPrincipalName": "alice@contoso.onmicrosoft.com",
+  "UserId": "9f8b7a6c-5d4e-3f2a-1b0c-9d8e7f6a5b4c",
+  "AppId": "11111111-2222-3333-4444-555555555555",
+  "AppDisplayName": "Contoso Internal Portal",
+  "IPAddress": "203.0.113.42",
+  "ClientAppUsed": "Mobile Apps and Desktop clients",
+  "CorrelationId": "9d8e7f6a-5b4c-3d2e-1f09-8a7b6c5d4e3f",
+  "ConditionalAccessStatus": "success",
+  "IsInteractive": false,
+  "TokenIssuerType": "AzureAD",
+  "ResourceDisplayName": "Microsoft Graph",
+  "ResourceIdentity": "00000003-0000-0000-c000-000000000000",
+  "RiskState": "none",
+  "RiskDetail": "none",
+  "RiskLevelAggregated": "none",
+  "AuthenticationRequirement": "singleFactorAuthentication",
+  "IncomingTokenType": "primaryRefreshToken",
+  "AuthenticationProtocol": "none",
+  "ResultType": "0",
+  "ResultSignature": "None",
+  "Status": {
     "errorCode": 0,
     "failureReason": "Other."
   },
-  "deviceDetail": {
+  "DeviceDetail": {
     "deviceId": "ab12cd34-ef56-7890-abcd-ef0123456789",
     "displayName": "ALICE-LAPTOP",
     "operatingSystem": "Windows 11",
@@ -395,7 +405,7 @@ Refresh redemptions show up in `AADNonInteractiveUserSignInLogs`. The `correlati
     "isManaged": true,
     "trustType": "Azure AD joined"
   },
-  "appliedConditionalAccessPolicies": [
+  "ConditionalAccessPolicies": [
     {
       "id": "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9",
       "displayName": "Require MFA for all users",
@@ -405,7 +415,7 @@ Refresh redemptions show up in `AADNonInteractiveUserSignInLogs`. The `correlati
       "conditionsNotSatisfied": 0
     }
   ],
-  "authenticationDetails": [
+  "AuthenticationDetails": [
     {
       "authenticationStepDateTime": "2026-05-08T10:18:55.180Z",
       "authenticationMethod": "Previously satisfied",
@@ -415,14 +425,14 @@ Refresh redemptions show up in `AADNonInteractiveUserSignInLogs`. The `correlati
       "authenticationStepRequirement": "Primary authentication"
     }
   ],
-  "authenticationProcessingDetails": [
+  "AuthenticationProcessingDetails": [
     {"key": "Is CAE Token", "value": "True"},
     {"key": "Oauth Scope Info", "value": "[\"User.Read\",\"openid\",\"profile\",\"offline_access\"]"}
   ]
 }
 ```
 
-Tells: `incomingTokenType: "primaryRefreshToken"` (or `"refreshToken"` for non-PRT scenarios), `isInteractive: false`, `authenticationMethod: "Previously satisfied"`, and the row lives in `AADNonInteractiveUserSignInLogs`.
+Tells: `IncomingTokenType: "primaryRefreshToken"` (or `"refreshToken"` for non-PRT scenarios), `IsInteractive: false`, `AuthenticationMethod: "Previously satisfied"`, and the row lives in `AADNonInteractiveUserSignInLogs`.
 
 ---
 
@@ -499,33 +509,31 @@ Service principal sign-ins land in `AADServicePrincipalSignInLogs`, **not** `Sig
 
 ```json
 {
-  "id": "5d4e3f2a-1b0c-9d8e-7f6a-5b4c3d2e1f09",
-  "createdDateTime": "2026-05-08T11:00:13.708Z",
-  "appId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-  "servicePrincipalId": "77665544-3322-1100-ffee-ddccbbaa9988",
-  "servicePrincipalName": "Contoso Nightly Sync Daemon",
-  "ipAddress": "198.51.100.21",
-  "resultType": "0",
-  "resultSignature": "SUCCESS",
-  "resultDescription": null,
-  "correlationId": "deadbeef-1234-5678-9abc-def012345678",
-  "conditionalAccessStatus": "notApplied",
-  "tokenIssuerType": "AzureAD",
-  "resourceDisplayName": "Microsoft Graph",
-  "resourceId": "00000003-0000-0000-c000-000000000000",
-  "resourceTenantId": "your-tenant-id",
-  "homeTenantId": "your-tenant-id",
-  "incomingTokenType": "none",
-  "authenticationProtocol": "oAuth2",
-  "uniqueTokenIdentifier": "Yk1nQ2VVdEpV...",
-  "servicePrincipalCredentialKeyId": "11112222-3333-4444-5555-666677778888",
-  "servicePrincipalCredentialThumbprint": "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
-  "status": {
-    "errorCode": 0,
-    "failureReason": "Other."
-  },
-  "appliedConditionalAccessPolicies": [],
-  "authenticationProcessingDetails": [
+  "TenantId": "your-tenant-id",
+  "TimeGenerated": "2026-05-08T11:00:13.708Z",
+  "Id": "5d4e3f2a-1b0c-9d8e-7f6a-5b4c3d2e1f09",
+  "CreatedDateTime": "2026-05-08T11:00:13.708Z",
+  "AppId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "ServicePrincipalId": "77665544-3322-1100-ffee-ddccbbaa9988",
+  "ServicePrincipalName": "Contoso Nightly Sync Daemon",
+  "IPAddress": "198.51.100.21",
+  "ResultType": "0",
+  "ResultSignature": "SUCCESS",
+  "ResultDescription": "",
+  "CorrelationId": "deadbeef-1234-5678-9abc-def012345678",
+  "ConditionalAccessStatus": "notApplied",
+  "TokenIssuerType": "AzureAD",
+  "ResourceDisplayName": "Microsoft Graph",
+  "ResourceIdentity": "00000003-0000-0000-c000-000000000000",
+  "ResourceTenantId": "your-tenant-id",
+  "HomeTenantId": "your-tenant-id",
+  "IncomingTokenType": "none",
+  "AuthenticationProtocol": "none",
+  "UniqueTokenIdentifier": "Yk1nQ2VVdEpV...",
+  "ServicePrincipalCredentialKeyId": "11112222-3333-4444-5555-666677778888",
+  "ServicePrincipalCredentialThumbprint": "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
+  "ConditionalAccessPolicies": [],
+  "AuthenticationProcessingDetails": [
     {"key": "Authentication credential used", "value": "Certificate"},
     {"key": "Oauth Scope Info", "value": "[\".default\"]"},
     {"key": "Is CAE Token", "value": "False"}
@@ -533,7 +541,7 @@ Service principal sign-ins land in `AADServicePrincipalSignInLogs`, **not** `Sig
 }
 ```
 
-Tells: lives in `AADServicePrincipalSignInLogs`, no `userPrincipalName`, `Authentication credential used` shows `Certificate` or `ClientSecret` or `FederatedIdentityCredential`. If you see `ClientSecret` for an app you intended to make passwordless, that's an audit finding — and the basis for one of Part II's most useful detection rules.
+Tells: lives in `AADServicePrincipalSignInLogs`, no `UserPrincipalName`, `Authentication credential used` shows `Certificate` or `ClientSecret` or `FederatedIdentityCredential`. If you see `ClientSecret` for an app you intended to make passwordless, that's an audit finding — and the basis for one of Part II's most useful detection rules.
 
 ---
 
@@ -565,29 +573,33 @@ The two distinguishing parameters: `grant_type=urn:ietf:params:oauth:grant-type:
 
 ```json
 {
-  "id": "4c3b2a19-8e7d-6c5b-4a3a-2b1c0d9e8f7a",
-  "createdDateTime": "2026-05-08T11:42:09.115Z",
-  "userDisplayName": "Alice Anderson",
-  "userPrincipalName": "alice@contoso.onmicrosoft.com",
-  "userId": "9f8b7a6c-5d4e-3f2a-1b0c-9d8e7f6a5b4c",
-  "appId": "middle-tier-app-id",
-  "appDisplayName": "Contoso Orders API",
-  "ipAddress": "10.20.30.40",
-  "clientAppUsed": "Mobile Apps and Desktop clients",
-  "correlationId": "112233aa-bbcc-ddee-ff00-112233445566",
-  "conditionalAccessStatus": "success",
-  "isInteractive": false,
-  "tokenIssuerType": "AzureAD",
-  "resourceDisplayName": "Microsoft Graph",
-  "resourceId": "00000003-0000-0000-c000-000000000000",
-  "incomingTokenType": "jwt",
-  "authenticationProtocol": "oAuth2",
-  "authenticationRequirement": "singleFactorAuthentication",
-  "status": {
+  "TenantId": "your-tenant-id",
+  "TimeGenerated": "2026-05-08T11:42:09.115Z",
+  "Id": "4c3b2a19-8e7d-6c5b-4a3a-2b1c0d9e8f7a",
+  "CreatedDateTime": "2026-05-08T11:42:09.115Z",
+  "UserDisplayName": "Alice Anderson",
+  "UserPrincipalName": "alice@contoso.onmicrosoft.com",
+  "UserId": "9f8b7a6c-5d4e-3f2a-1b0c-9d8e7f6a5b4c",
+  "AppId": "middle-tier-app-id",
+  "AppDisplayName": "Contoso Orders API",
+  "IPAddress": "10.20.30.40",
+  "ClientAppUsed": "Mobile Apps and Desktop clients",
+  "CorrelationId": "112233aa-bbcc-ddee-ff00-112233445566",
+  "ConditionalAccessStatus": "success",
+  "IsInteractive": false,
+  "TokenIssuerType": "AzureAD",
+  "ResourceDisplayName": "Microsoft Graph",
+  "ResourceIdentity": "00000003-0000-0000-c000-000000000000",
+  "IncomingTokenType": "jwt",
+  "AuthenticationProtocol": "none",
+  "AuthenticationRequirement": "singleFactorAuthentication",
+  "ResultType": "0",
+  "ResultSignature": "None",
+  "Status": {
     "errorCode": 0,
     "failureReason": "Other."
   },
-  "appliedConditionalAccessPolicies": [
+  "ConditionalAccessPolicies": [
     {
       "id": "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9",
       "displayName": "Require MFA for all users",
@@ -597,7 +609,7 @@ The two distinguishing parameters: `grant_type=urn:ietf:params:oauth:grant-type:
       "conditionsNotSatisfied": 0
     }
   ],
-  "authenticationDetails": [
+  "AuthenticationDetails": [
     {
       "authenticationStepDateTime": "2026-05-08T11:42:09.090Z",
       "authenticationMethod": "Previously satisfied",
@@ -607,7 +619,7 @@ The two distinguishing parameters: `grant_type=urn:ietf:params:oauth:grant-type:
       "authenticationStepRequirement": "Primary authentication"
     }
   ],
-  "authenticationProcessingDetails": [
+  "AuthenticationProcessingDetails": [
     {"key": "Authentication credential used", "value": "ClientSecret"},
     {"key": "Oauth Scope Info", "value": "[\"User.Read\"]"},
     {"key": "Is CAE Token", "value": "False"}
@@ -615,7 +627,7 @@ The two distinguishing parameters: `grant_type=urn:ietf:params:oauth:grant-type:
 }
 ```
 
-Tells: user identity present, but `incomingTokenType: "jwt"` (a token was traded in, not a code), and `appId` is the *middle tier*, not the original front-end client. The IP is the middle tier's internal IP — not the user's. Defenders trying to geolocate the user from this row will be misled; pivot back to the originating sign-in to find the real IP.
+Tells: user identity present, but `IncomingTokenType: "jwt"` (a token was traded in, not a code), and `AppId` is the *middle tier*, not the original front-end client. The IP is the middle tier's internal IP — not the user's. Defenders trying to geolocate the user from this row will be misled; pivot back to the originating sign-in to find the real IP.
 
 ### Device Code
 
@@ -649,40 +661,45 @@ while True:
     raise RuntimeError(poll.json())
 ```
 
-⚠️ Device code phishing is a top vector against Entra. The IP that appears in the resulting `SigninLogs` row is the *user's* IP (where they completed the prompt), not the *attacker's* IP (where polling happens). This is why "sign-in from new country" detections miss device code phishing entirely. The signature to alert on is `authenticationProtocol: "deviceCode"` itself — see Part II §11.
+⚠️ Device code phishing is a top vector against Entra. The IP that appears in the resulting `SigninLogs` row is the *user's* IP (where they completed the prompt), not the *attacker's* IP (where polling happens). This is why "sign-in from new country" detections miss device code phishing entirely. The signature to alert on is `AuthenticationProtocol == "deviceCode"` itself — see Part II §11.
 
 ```json
 {
-  "id": "7a6b5c4d-3e2f-1098-7654-3210fedcba98",
-  "createdDateTime": "2026-05-08T12:05:44.331Z",
-  "userDisplayName": "Bob Bennett",
-  "userPrincipalName": "bob@contoso.onmicrosoft.com",
-  "userId": "8c7b6a59-4e3d-2c1b-0a98-765432109876",
-  "appId": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
-  "appDisplayName": "Microsoft Azure CLI",
-  "ipAddress": "203.0.113.99",
-  "clientAppUsed": "Mobile Apps and Desktop clients",
-  "correlationId": "abcdef01-2345-6789-abcd-ef0123456789",
-  "conditionalAccessStatus": "success",
-  "isInteractive": true,
-  "tokenIssuerType": "AzureAD",
-  "resourceDisplayName": "Microsoft Graph",
-  "resourceId": "00000003-0000-0000-c000-000000000000",
-  "incomingTokenType": "none",
-  "authenticationProtocol": "deviceCode",
-  "authenticationRequirement": "multiFactorAuthentication",
-  "status": {"errorCode": 0, "failureReason": "Other."},
-  "deviceDetail": {
+  "TenantId": "your-tenant-id",
+  "TimeGenerated": "2026-05-08T12:05:44.331Z",
+  "Id": "7a6b5c4d-3e2f-1098-7654-3210fedcba98",
+  "CreatedDateTime": "2026-05-08T12:05:44.331Z",
+  "UserDisplayName": "Bob Bennett",
+  "UserPrincipalName": "bob@contoso.onmicrosoft.com",
+  "UserId": "8c7b6a59-4e3d-2c1b-0a98-765432109876",
+  "AppId": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+  "AppDisplayName": "Microsoft Azure CLI",
+  "IPAddress": "203.0.113.99",
+  "ClientAppUsed": "Mobile Apps and Desktop clients",
+  "CorrelationId": "abcdef01-2345-6789-abcd-ef0123456789",
+  "ConditionalAccessStatus": "success",
+  "IsInteractive": true,
+  "TokenIssuerType": "AzureAD",
+  "ResourceDisplayName": "Microsoft Graph",
+  "ResourceIdentity": "00000003-0000-0000-c000-000000000000",
+  "IncomingTokenType": "none",
+  "AuthenticationProtocol": "deviceCode",
+  "AuthenticationRequirement": "multiFactorAuthentication",
+  "ResultType": "0",
+  "ResultSignature": "None",
+  "Status": {"errorCode": 0, "failureReason": "Other."},
+  "DeviceDetail": {
     "browser": "Chrome 129.0",
     "operatingSystem": "MacOs",
     "trustType": ""
   },
-  "location": {
+  "LocationDetails": {
     "city": "Amsterdam",
     "countryOrRegion": "NL",
     "geoCoordinates": {"latitude": 52.3676, "longitude": 4.9041}
   },
-  "appliedConditionalAccessPolicies": [
+  "Location": "NL",
+  "ConditionalAccessPolicies": [
     {
       "id": "9988aabb-ccdd-eeff-0011-223344556677",
       "displayName": "Block device code flow",
@@ -692,7 +709,7 @@ while True:
       "conditionsNotSatisfied": 1
     }
   ],
-  "authenticationDetails": [
+  "AuthenticationDetails": [
     {
       "authenticationStepDateTime": "2026-05-08T12:05:42.901Z",
       "authenticationMethod": "Password",
@@ -708,7 +725,7 @@ while True:
       "authenticationStepRequirement": "Multifactor authentication"
     }
   ],
-  "authenticationProcessingDetails": [
+  "AuthenticationProcessingDetails": [
     {"key": "Login Hint Present", "value": "False"},
     {"key": "Oauth Scope Info", "value": "[\"User.Read\",\"openid\",\"profile\",\"offline_access\"]"}
   ]
@@ -733,24 +750,28 @@ tokens = requests.post(
 ).json()
 ```
 
-Log fingerprint: `authenticationProtocol: "ropc"`. Every hit is a ticket — credential-spray attacks hit the token endpoint directly with this grant type rather than going through the browser sign-in page.
+Log fingerprint: `AuthenticationProtocol == "ropc"`. Every hit is a ticket — credential-spray attacks hit the token endpoint directly with this grant type rather than going through the browser sign-in page.
 
 ```json
 {
-  "id": "11223344-5566-7788-99aa-bbccddeeff00",
-  "createdDateTime": "2026-05-08T12:33:01.009Z",
-  "userPrincipalName": "alice@contoso.onmicrosoft.com",
-  "appId": "11111111-2222-3333-4444-555555555555",
-  "appDisplayName": "Legacy Inventory Tool",
-  "clientAppUsed": "Mobile Apps and Desktop clients",
-  "isInteractive": false,
-  "incomingTokenType": "none",
-  "authenticationProtocol": "ropc",
-  "authenticationRequirement": "singleFactorAuthentication",
-  "status": {
+  "TenantId": "your-tenant-id",
+  "TimeGenerated": "2026-05-08T12:33:01.009Z",
+  "Id": "11223344-5566-7788-99aa-bbccddeeff00",
+  "CreatedDateTime": "2026-05-08T12:33:01.009Z",
+  "UserPrincipalName": "alice@contoso.onmicrosoft.com",
+  "AppId": "11111111-2222-3333-4444-555555555555",
+  "AppDisplayName": "Legacy Inventory Tool",
+  "ClientAppUsed": "Mobile Apps and Desktop clients",
+  "IsInteractive": false,
+  "IncomingTokenType": "none",
+  "AuthenticationProtocol": "ropc",
+  "AuthenticationRequirement": "singleFactorAuthentication",
+  "ResultType": "0",
+  "ResultSignature": "None",
+  "Status": {
     "errorCode": 0
   },
-  "authenticationDetails": [
+  "AuthenticationDetails": [
     {
       "authenticationMethod": "Password",
       "authenticationMethodDetail": "Password in the cloud",
@@ -758,7 +779,7 @@ Log fingerprint: `authenticationProtocol: "ropc"`. Every hit is a ticket — cre
       "authenticationStepRequirement": "Primary authentication"
     }
   ],
-  "authenticationProcessingDetails": [
+  "AuthenticationProcessingDetails": [
     {"key": "Oauth Scope Info", "value": "[\"User.Read\"]"}
   ]
 }
@@ -766,15 +787,15 @@ Log fingerprint: `authenticationProtocol: "ropc"`. Every hit is a ticket — cre
 
 ### Implicit — DEPRECATED
 
-Old SPA flow: tokens delivered in URL fragment. Replaced by auth code + PKCE for SPAs. Tokens in URL fragments end up in browser history, referrer headers, JavaScript globals — every place tokens shouldn't be. If you see `authenticationProtocol: "oAuth2Implicit"` in your logs it's probably an old AngularJS app from 2018 — find it and migrate it.
+Old SPA flow: tokens delivered in URL fragment. Replaced by auth code + PKCE for SPAs. Tokens in URL fragments end up in browser history, referrer headers, JavaScript globals — every place tokens shouldn't be. If you see `AuthenticationProtocol == "oAuth2Implicit"` in your logs it's probably an old AngularJS app from 2018 — find it and migrate it.
 
 ### Hybrid (`response_type=code id_token`)
 
-Server-side web app gets *both* an auth code (to exchange server-side for AT/RT) **and** an ID token (delivered immediately to the client) in the same round trip. Used by ASP.NET's old OpenIdConnect middleware. The differences from §2: `response_type=code id_token`, `response_mode=form_post` (so the ID token doesn't end up in browser history), nonce required (because the ID token comes via the front channel). In logs it looks essentially identical to plain auth code (`authenticationProtocol: "oAuth2"`).
+Server-side web app gets *both* an auth code (to exchange server-side for AT/RT) **and** an ID token (delivered immediately to the client) in the same round trip. Used by ASP.NET's old OpenIdConnect middleware. The differences from §2: `response_type=code id_token`, `response_mode=form_post` (so the ID token doesn't end up in browser history), nonce required (because the ID token comes via the front channel). In logs it looks essentially identical to plain auth code — `AuthenticationProtocol == "none"` like other OAuth-family flows.
 
 ### SAML 2.0
 
-Not OAuth/OIDC, but Entra speaks it heavily for legacy enterprise apps. Different protocol, different endpoint (`/saml2`), different ceremony (POST binding, signed assertions, no access tokens, no refresh tokens). In sign-in logs SAML shows up as `authenticationProtocol: "saml2"` and `tokenIssuerType: "AzureAD"`. The resource is the SAML-configured enterprise app (e.g., Salesforce, Workday).
+Not OAuth/OIDC, but Entra speaks it heavily for legacy enterprise apps. Different protocol, different endpoint (`/saml2`), different ceremony (POST binding, signed assertions, no access tokens, no refresh tokens). In sign-in logs SAML shows up as `AuthenticationProtocol == "saml2.0"` (sometimes `"saml"`) and `TokenIssuerType == "AzureAD"`. The resource is the SAML-configured enterprise app (e.g., Salesforce, Workday).
 
 ---
 
@@ -836,31 +857,42 @@ You should be able to look at a sign-in log row and immediately name the flow. C
 
 | Log signal | Flow |
 |---|---|
-| `AuthenticationProtocol == "oAuth2"` + `IncomingTokenType == "none"` + `IsInteractive == true` + `ClientAppUsed == "Browser"` | Authorization code + PKCE |
-| `AuthenticationProtocol == "oAuth2"` + `IncomingTokenType` in (`"refreshToken"`, `"primaryRefreshToken"`) | Refresh token |
+| `IncomingTokenType == "none"` + `IsInteractive == true` + `ClientAppUsed == "Browser"` + `ResourceDisplayName` set | Authorization code + PKCE (interactive) |
+| `IncomingTokenType` in (`"refreshToken"`, `"primaryRefreshToken"`) + `IsInteractive == false` | Refresh token redemption |
 | In `AADServicePrincipalSignInLogs` + no user + `Authentication credential used` set | Client credentials |
 | `IncomingTokenType == "jwt"` + non-interactive + user present + appId is API not client | On-Behalf-Of |
 | `AuthenticationProtocol == "deviceCode"` | Device code |
 | `AuthenticationProtocol == "ropc"` | ROPC (investigate every hit) |
 | `AuthenticationProtocol == "oAuth2Implicit"` | Implicit (deprecated, find and migrate) |
-| `AuthenticationProtocol == "saml2"` | SAML enterprise app SSO |
+| `AuthenticationProtocol` in (`"saml2.0"`, `"saml"`, `"wsFederation"`) | SAML / WS-Fed enterprise app SSO |
 
-KQL to summarize what your tenant actually uses:
+> ### `AuthenticationProtocol` in practice: an important calibration
+>
+> Earlier versions of this guide leaned on `AuthenticationProtocol == "oAuth2"` as the primary fingerprint for OAuth flows. **In production tenants this is wrong.** The field's actual behavior, validated against real high-volume tenant data:
+>
+> - **OAuth-based flows** (auth code + PKCE, refresh, hybrid, OBO) typically show `AuthenticationProtocol` as **`"none"`** or **empty/null**. OAuth/OIDC is Entra's implicit baseline, so the field doesn't bother labeling it.
+> - **Non-OAuth flows** (SAML, WS-Fed, device code, ROPC) are where the field is reliably populated, because that's what it exists to differentiate. You'll see `"saml2.0"` (sometimes `"saml"`), `"wsFederation"`, `"deviceCode"`, `"ropc"`.
+> - The Microsoft Graph schema reflects this asymmetry — there's a separate `authenticationProtocol` enum on the `samlOrWsFedProvider` resource type with only `wsFed`, `saml`, `unknownFutureValue` as values, no OAuth value at all. (That's the Graph-side schema for *configuring* federated IdPs — separate from the `AuthenticationProtocol` column in `SigninLogs` that we care about here.)
+>
+> **What this means for the cheatsheet above:** for the OAuth-family flows (auth code, refresh, OBO), do not filter on `AuthenticationProtocol`. Use `IncomingTokenType`, `ClientAppUsed`, `IsInteractive`, and `ResourceDisplayName` instead — these are populated consistently and they actually distinguish the flows. Only use `AuthenticationProtocol` as a positive filter for SAML, WS-Fed, device code, ROPC, and implicit, where it's the cleanest signal.
+>
+> The JSON examples in Part I (§§2–5) reflect this: OAuth-family flows show `"AuthenticationProtocol": "none"`, and the non-OAuth flows show their respective values (`"deviceCode"`, `"ropc"`, `"saml2.0"`, etc.). All field names in those samples use the Log Analytics column-name format (PascalCase) so you can copy any field directly into a KQL query — see the data-source note at the top of the guide for the corresponding Defender XDR field names.
+
+KQL to summarize what your tenant actually uses, leaning on the right fields:
 
 ```kql
 union SigninLogs, AADNonInteractiveUserSignInLogs, AADServicePrincipalSignInLogs
 | where TimeGenerated > ago(7d)
 | extend Protocol = tostring(AuthenticationProtocol)
 | extend Incoming = tostring(IncomingTokenType)
-| summarize Count = count() by Protocol, Incoming, AppDisplayName
+| summarize Count = count() 
+    by Protocol, Incoming, ClientAppUsed, AppDisplayName
 | sort by Count desc
 ```
 
-Run this on day one of any new role. It tells you which apps are healthy (modern flows) and which are tech debt (ROPC, implicit, legacy clients).
+Run this on day one of any new role. Most rows will land in `Protocol == "none"` + `Incoming == "none"` (OAuth fresh auth) or `Protocol == "none"` + `Incoming == "primaryRefreshToken"` (OAuth refresh). The interesting tails are everything else — `"saml2.0"`, `"deviceCode"`, `"ropc"`, `"oAuth2Implicit"`, or any value you don't recognize. Investigate the tails.
 
-> **`AuthenticationProtocol` is not always populated.** Microsoft's Graph signIn schema treats the field as nullable, and Entra omits it (it surfaces as empty string `""` or null in Sentinel) on a non-trivial fraction of rows. You'll see it missing on many failed sign-ins (where authorization didn't get far enough to determine the protocol), older log entries from before the field was added to the schema, certain managed identity sign-ins, some cross-tenant federation paths, and a handful of edge-case flows that haven't been backfilled. Practical implication for the queries above: positive matches (`where AuthenticationProtocol == "deviceCode"`) are reliable. **Negative matches** (`where AuthenticationProtocol !in (...)` to find "weird" flows) are not — you'll get false positives from rows where the field is simply empty. When hunting for unusual flows, also filter `where isnotempty(AuthenticationProtocol)` or pivot off `IncomingTokenType` and `ClientAppUsed` instead, both of which are populated more consistently. The cheatsheet above lists the protocol because when present it's the cleanest fingerprint, not because it's a guaranteed field.
-
-The HTTP each flow generates — and the log row each call produces — is covered in detail in Part I (§§2–5). If a fingerprint above is unfamiliar, jump back: every `IncomingTokenType` and `AuthenticationProtocol` value maps to a specific request shape there.
+The HTTP each flow generates — and the log row each call produces — is covered in detail in Part I (§§2–5). If a fingerprint above is unfamiliar, jump back: every `IncomingTokenType` value maps to a specific request shape there.
 
 ---
 
