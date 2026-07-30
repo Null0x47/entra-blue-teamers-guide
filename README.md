@@ -432,7 +432,7 @@ Refresh redemptions show up in `AADNonInteractiveUserSignInLogs`. The `correlati
 }
 ```
 
-Tells: `IncomingTokenType: "primaryRefreshToken"` (or `"refreshToken"` for non-PRT scenarios), `IsInteractive: false`, `AuthenticationMethod: "Previously satisfied"`, and the row lives in `AADNonInteractiveUserSignInLogs`.
+Tells: `IncomingTokenType: "primaryRefreshToken"` (or `"refreshToken"` for non-PRT scenarios), `IsInteractive: false`, an `AuthenticationDetails` step of `"Previously satisfied"`, and the row lives in `AADNonInteractiveUserSignInLogs`. The `primaryRefreshToken` value specifically implies a PRT — a broker-issued artifact on an Entra-joined/registered Windows device (as in this sample, which is `Azure AD joined`). An ordinary web-app or SPA refresh with no device broker shows `"refreshToken"` instead; watch for that distinction when triaging.
 
 ---
 
@@ -470,7 +470,8 @@ with open("/secrets/app.key", "rb") as f:
 with open("/secrets/app.crt", "rb") as f:
     cert = x509.load_pem_x509_certificate(f.read())
 
-# Entra requires the cert thumbprint (SHA-1) base64url-encoded as `x5t` in the JWT header.
+# Entra accepts the SHA-1 cert thumbprint base64url-encoded as `x5t` in the JWT header.
+# (Entra also supports the SHA-256 thumbprint as `x5t#S256` — same idea, stronger hash.)
 x5t = base64.urlsafe_b64encode(cert.fingerprint(hashes.SHA1())).decode().rstrip("=")
 
 now = int(time.time())
@@ -795,7 +796,7 @@ Server-side web app gets *both* an auth code (to exchange server-side for AT/RT)
 
 ### SAML 2.0
 
-Not OAuth/OIDC, but Entra speaks it heavily for legacy enterprise apps. Different protocol, different endpoint (`/saml2`), different ceremony (POST binding, signed assertions, no access tokens, no refresh tokens). In sign-in logs SAML shows up as `AuthenticationProtocol == "saml2.0"` (sometimes `"saml"`) and `TokenIssuerType == "AzureAD"`. The resource is the SAML-configured enterprise app (e.g., Salesforce, Workday).
+Not OAuth/OIDC, but Entra speaks it heavily for legacy enterprise apps. Different protocol, different endpoint (`/saml2`), different ceremony (POST binding, signed assertions, no access tokens, no refresh tokens). In sign-in logs SAML shows up as `AuthenticationProtocol == "saml20"` (sometimes `"saml"`) and `TokenIssuerType == "AzureAD"`. The resource is the SAML-configured enterprise app (e.g., Salesforce, Workday).
 
 ---
 
@@ -836,7 +837,7 @@ The fields you'll touch in 80% of queries:
 - `UserPrincipalName`, `UserId` — identity. `UserId` (objectId) is stable; UPN can change on rename.
 - `AppId`, `AppDisplayName` — the *client* application acquiring a token.
 - `ResourceId`, `ResourceDisplayName` — the *resource* API the token targets.
-- `IpAddress`, `Location` — where the token request came from.
+- `IPAddress`, `Location` — where the token request came from.
 - `ConditionalAccessStatus` — `success`, `failure`, `notApplied`, `disabled`.
 - `RiskLevelDuringSignIn`, `RiskState`, `RiskEventTypes_v2` — Identity Protection signals.
 - `AuthenticationRequirement` — `singleFactorAuthentication` vs `multiFactorAuthentication`.
@@ -864,19 +865,19 @@ You should be able to look at a sign-in log row and immediately name the flow. C
 | `AuthenticationProtocol == "deviceCode"` | Device code |
 | `AuthenticationProtocol == "ropc"` | ROPC (investigate every hit) |
 | `AuthenticationProtocol == "oAuth2Implicit"` | Implicit (deprecated, find and migrate) |
-| `AuthenticationProtocol` in (`"saml2.0"`, `"saml"`, `"wsFederation"`) | SAML / WS-Fed enterprise app SSO |
+| `AuthenticationProtocol` in (`"saml20"`, `"saml"`, `"wsFederation"`) | SAML / WS-Fed enterprise app SSO |
 
 > ### `AuthenticationProtocol` in practice: an important calibration
 >
-> Earlier versions of this guide leaned on `AuthenticationProtocol == "oAuth2"` as the primary fingerprint for OAuth flows. **In production tenants this is wrong.** The field's actual behavior, validated against real high-volume tenant data:
+> `oAuth2` **is** a documented, valid value of the `AuthenticationProtocol` field — so earlier versions of this guide leaned on `AuthenticationProtocol == "oAuth2"` as the primary fingerprint for OAuth flows. **In practice that's a trap:** the field is populated inconsistently for OAuth-family flows, and in high-volume production tenants those rows very often log as `"none"` instead. Don't build your OAuth detections on it. The field's practical behavior:
 >
-> - **OAuth-based flows** (auth code + PKCE, refresh, hybrid, OBO) typically show `AuthenticationProtocol` as **`"none"`** or **empty/null**. OAuth/OIDC is Entra's implicit baseline, so the field doesn't bother labeling it.
-> - **Non-OAuth flows** (SAML, WS-Fed, device code, ROPC) are where the field is reliably populated, because that's what it exists to differentiate. You'll see `"saml2.0"` (sometimes `"saml"`), `"wsFederation"`, `"deviceCode"`, `"ropc"`.
+> - **OAuth-based flows** (auth code + PKCE, refresh, hybrid, OBO) frequently show `AuthenticationProtocol` as **`"none"`** (or empty/null) rather than `"oAuth2"`. OAuth/OIDC is Entra's implicit baseline, so the field often doesn't bother labeling it — you can't rely on `"oAuth2"` appearing.
+> - **Non-OAuth flows** (SAML, WS-Fed, device code, ROPC) are where the field is reliably populated, because that's what it exists to differentiate. You'll see `"saml20"` (sometimes `"saml"`), `"wsFederation"`, `"deviceCode"`, `"ropc"`.
 > - The Microsoft Graph schema reflects this asymmetry — there's a separate `authenticationProtocol` enum on the `samlOrWsFedProvider` resource type with only `wsFed`, `saml`, `unknownFutureValue` as values, no OAuth value at all. (That's the Graph-side schema for *configuring* federated IdPs — separate from the `AuthenticationProtocol` column in `SigninLogs` that we care about here.)
 >
 > **What this means for the cheatsheet above:** for the OAuth-family flows (auth code, refresh, OBO), do not filter on `AuthenticationProtocol`. Use `IncomingTokenType`, `ClientAppUsed`, `IsInteractive`, and `ResourceDisplayName` instead — these are populated consistently and they actually distinguish the flows. Only use `AuthenticationProtocol` as a positive filter for SAML, WS-Fed, device code, ROPC, and implicit, where it's the cleanest signal.
 >
-> The JSON examples in Part I (§§2–5) reflect this: OAuth-family flows show `"AuthenticationProtocol": "none"`, and the non-OAuth flows show their respective values (`"deviceCode"`, `"ropc"`, `"saml2.0"`, etc.). All field names in those samples use the Log Analytics column-name format (PascalCase) so you can copy any field directly into a KQL query — see the data-source note at the top of the guide for the corresponding Defender XDR field names.
+> The JSON examples in Part I (§§2–5) reflect this: OAuth-family flows show `"AuthenticationProtocol": "none"`, and the non-OAuth flows show their respective values (`"deviceCode"`, `"ropc"`, `"saml20"`, etc.). All field names in those samples use the Log Analytics column-name format (PascalCase) so you can copy any field directly into a KQL query — see the data-source note at the top of the guide for the corresponding Defender XDR field names.
 
 KQL to summarize what your tenant actually uses, leaning on the right fields:
 
@@ -890,7 +891,7 @@ union SigninLogs, AADNonInteractiveUserSignInLogs, AADServicePrincipalSignInLogs
 | sort by Count desc
 ```
 
-Run this on day one of any new role. Most rows will land in `Protocol == "none"` + `Incoming == "none"` (OAuth fresh auth) or `Protocol == "none"` + `Incoming == "primaryRefreshToken"` (OAuth refresh). The interesting tails are everything else — `"saml2.0"`, `"deviceCode"`, `"ropc"`, `"oAuth2Implicit"`, or any value you don't recognize. Investigate the tails.
+Run this on day one of any new role. Most rows will land in `Protocol == "none"` + `Incoming == "none"` (OAuth fresh auth) or `Protocol == "none"` + `Incoming == "primaryRefreshToken"` (OAuth refresh). The interesting tails are everything else — `"saml20"`, `"deviceCode"`, `"ropc"`, `"oAuth2Implicit"`, or any value you don't recognize. Investigate the tails.
 
 The HTTP each flow generates — and the log row each call produces — is covered in detail in Part I (§§2–5). If a fingerprint above is unfamiliar, jump back: every `IncomingTokenType` value maps to a specific request shape there.
 
@@ -918,7 +919,7 @@ union SigninLogs, AADNonInteractiveUserSignInLogs
 | where TimeGenerated between (datetime(2026-05-08T13:00:00Z) .. datetime(2026-05-08T14:00:00Z))
 | where UserPrincipalName == "alice@contoso.onmicrosoft.com"
 | project TimeGenerated, AppDisplayName, ResourceDisplayName, IncomingTokenType, 
-          IpAddress, IsInteractive, ConditionalAccessStatus, ResultType
+          IPAddress, IsInteractive, ConditionalAccessStatus, ResultType
 | order by TimeGenerated asc
 ```
 
@@ -953,7 +954,7 @@ CAE doesn't react to "anything." It reacts to a specific list of **critical even
 - User flagged as high-risk by Identity Protection.
 - Token's IP changing outside the trusted IP ranges defined in a Conditional Access location policy (when "Strict Location Enforcement" is enabled).
 
-Two important latency notes from Microsoft's own docs: critical events propagate in **near-real-time but with up to 15-minute latency** because of event distribution time. **IP location enforcement is instant.** So password resets and account disables protect within ~10 minutes; an attacker exfiltrating a stolen token from outside trusted IPs gets cut off the moment they make a request.
+Two important latency notes from Microsoft's own docs: critical events propagate in **near-real-time but with up to 15-minute latency** because of event distribution time. **IP location enforcement is instant.** So password resets and account disables protect within ~15 minutes; an attacker exfiltrating a stolen token from outside trusted IPs gets cut off the moment they make a request.
 
 ### The claims challenge mechanic
 
@@ -1016,13 +1017,13 @@ Each row is a (client app, resource API) pair with the CAE issuance rate. Patter
 
 If you see `xms_cc: ["CP1"]` AND a 1-hour expiry, the client *asked* for CAE but the *resource* doesn't support it, so Entra issued a normal token. If `xms_cc` is missing entirely, the client never asked for CAE.
 
-**Method 3 — Check tenant CA policy.** Conditional Access → Session controls → Customize continuous access evaluation. Three options:
+**Method 3 — Check tenant CA policy.** Conditional Access → Session controls → Customize continuous access evaluation. The current modes are:
 
-- **Disable** — no CAE for anyone (don't pick this).
-- **Migrate** — default; CAE enabled for capable client/resource pairs.
-- **Strict Location Enforcement** — CAE additionally revokes when user IP changes outside trusted locations.
+- **Disable** — no CAE for the targeted users/apps (don't pick this). Only takes effect when the policy targets *All resources* with no other conditions.
+- **(Enabled)** — the default state when CAE isn't disabled; CAE applies for capable client/resource pairs and issues long-lived, back-channel-revocable tokens.
+- **Strict location enforcement** — CAE additionally revokes when the token's IP moves outside the trusted locations in a CA location policy. Highest-security location mode; requires you understand your network's egress routing.
 
-Some tenants also have a *Strict Enforcement* mode that requires CAE-capable clients; non-CAE clients are blocked rather than falling back to short-lived tokens. Check your CA policy state to know which mode you're actually in.
+Older tenants that configured CAE under the legacy **Security** blade see a one-time **Migrate** action that moves those settings into a Conditional Access policy — that's a migration button, not a standing mode. Check your CA policy state to know which mode you're actually in.
 
 **Method 4 — Audit your own apps' client capabilities.** If you build apps that consume Microsoft APIs, decode their tokens and check `xms_cc`. For MSAL Python, the opt-in is `client_capabilities=["cp1"]` on the constructor. Modern Azure SDKs (`azure-identity`, etc.) set CP1 automatically when talking to ARM. Hand-rolled implementations against `/token` directly don't get CAE without explicitly requesting it.
 
@@ -1057,7 +1058,7 @@ The ones most often abused in incident response. The "FOCI" column reflects the 
 | `04b07795-8ddb-461a-bbee-02f9e1bf7b46` | Microsoft Azure CLI | Yes | Pre-consented to ARM + Graph |
 | `1950a258-227b-4e31-a9cf-717495945fc2` | Microsoft Azure PowerShell | Yes | ARM + Graph |
 | `1b730954-1685-4b74-9bfd-dac224a7b894` | Azure AD PowerShell (legacy) | No | Directory access (deprecated module but still works) |
-| `14d82eec-204b-4c2f-b7e8-296a70dab67e` | Microsoft Graph Command Line Tools | No | Default app for `Connect-MgGraph`, broad Graph scopes |
+| `14d82eec-204b-4c2f-b7e8-296a70dab67e` | Microsoft Graph Command Line Tools | No (unconfirmed) | Default app for `Connect-MgGraph`, broad Graph scopes |
 | `d3590ed6-52b3-4102-aeff-aad2292ab01c` | Microsoft Office | Yes | Mailbox + files |
 | `1fec8e78-bce4-4aaf-ab1b-5451cc387264` | Microsoft Teams | Yes | Teams + Graph |
 | `872cd9fa-d31f-45e0-9eab-6e460a02d1f1` | Visual Studio | Yes | Broad developer scopes |
@@ -1131,7 +1132,7 @@ SigninLogs
     "00000002-0000-0000-c000-000000000000"    // legacy AAD Graph
   )
 | where ResultType == 0
-| project TimeGenerated, UserPrincipalName, AppDisplayName, ResourceDisplayName, IpAddress
+| project TimeGenerated, UserPrincipalName, AppDisplayName, ResourceDisplayName, IPAddress
 ```
 
 Azure CLI tokens hitting Exchange Online or SharePoint = investigate.
@@ -1434,14 +1435,13 @@ Tools like Evilginx run a reverse proxy between victim and `login.microsoftonlin
 SigninLogs
 | where TimeGenerated > ago(7d)
 | where ResultType == 0
-| extend ASN = tostring(parse_json(tostring(AutonomousSystemNumber)))
 | summarize 
     SignInTimes = make_list(TimeGenerated, 100),
-    IPs = make_set(IpAddress, 50),
-    ASNs = make_set(NetworkLocationDetails, 50)
+    IPs = make_set(IPAddress, 50),
+    ASNs = make_set(AutonomousSystemNumber, 50)
     by UserPrincipalName, bin(TimeGenerated, 1h)
-| where array_length(IPs) > 2
-| sort by TimeGenerated desc
+| where array_length(IPs) > 2 or array_length(ASNs) > 1
+| sort by UserPrincipalName asc
 ```
 
 ### Primary Refresh Token (PRT) theft
@@ -1785,7 +1785,7 @@ AADRiskDetection
 | project TimeGenerated, UserPrincipalName, RiskEventType, IPAddress
 ```
 
-If you don't, maintain your own IP threat list and join against `SigninLogs.IpAddress`.
+If you don't, maintain your own IP threat list and join against `SigninLogs.IPAddress`.
 
 ---
 
@@ -2013,7 +2013,7 @@ The investigative goal in the first 10 minutes: **a complete timeline from inbou
     Revoke-MgUserSignInSession -UserId <upn>
     ```
 
-    This invalidates refresh tokens. **It does not kill access tokens already issued** — those expire naturally (≤1 hour for non-CAE, up to 28h for CAE-eligible apps). Plan accordingly: the attacker may still have ~1h of access after revocation if the app already minted access tokens.
+    This invalidates refresh tokens. **It does not, by itself, instantly kill access tokens already issued** — but what happens next depends on CAE (§9). Revoking sessions fires a CAE revocation event: for **CAE-eligible** app/resource pairs the resource rejects the stale access token near-real-time (~15 min propagation), so containment is fast. For **non-CAE** pairs there's no revocation channel — the already-minted access token lives until natural expiry (≤~1 hour). Plan accordingly: against non-CAE resources the attacker may still have up to ~1h of access after you revoke.
 
 8. **Quarantine the source emails.** Defender → Threat Explorer → submit the `NetworkMessageId`s for soft delete or hard delete (depending on your policy). Use ZAP (Zero-hour Auto Purge) if available. This removes them from inboxes that haven't been read yet.
 
@@ -2262,7 +2262,7 @@ Both tables capture the same conceptual thing — an HTTP request to Graph — b
 | Aspect | `MicrosoftGraphActivityLogs` | `AADGraphActivityLogs` |
 |---|---|---|
 | Endpoint | `graph.microsoft.com` | `graph.windows.net` |
-| Status | Modern, GA since late 2023 | Legacy, data flowing since late 2025 |
+| Status | Modern, GA since April 2024 (preview 2023) | Legacy, data flowing since late 2025 |
 | Volume | Very high — every Graph SDK call lands here | Lower (and shrinking as apps migrate), but high per-attacker-tool because legacy attacker tooling concentrates here |
 | Caller IP field | `IPAddress` | `CallerIpAddress` |
 | App identifier | `AppId` | `AppId` |
