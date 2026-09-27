@@ -12,7 +12,7 @@ Scope: identity-layer attacks against Entra. Not endpoint, not network, not work
 
 > **A note on data sources.** Throughout this guide, KQL queries and log field names use the **Sentinel / Log Analytics** schema — i.e., logs exported from Entra ID's *Diagnostic settings* into a Log Analytics workspace. These are the tables most defenders run their hunts and detections against (`SigninLogs`, `AADNonInteractiveUserSignInLogs`, `AADServicePrincipalSignInLogs`, `AuditLogs`, `MicrosoftGraphActivityLogs`, `AADGraphActivityLogs`).
 >
-> **Microsoft Defender XDR** has a parallel set of advanced-hunting tables — `EntraIdSignInEvents` and `EntraIdSpnSignInEvents` (which replaced the preview-era `AADSignInEventsBeta` and `AADSpnSignInEventsBeta` on 9 December 2025). The data is largely the same — these are Defender XDR's view of the same underlying Entra sign-in stream — but **the column names are different**, and you can't paste a Sentinel query into Defender XDR's hunting console (or vice versa) without translation. Some of the most common mappings to keep in your head:
+> **Microsoft Defender XDR** has a parallel set of advanced-hunting tables — `EntraIdSignInEvents` and `EntraIdSpnSignInEvents` (the current GA tables, which supersede the preview-era `AADSignInEventsBeta` and `AADSpnSignInEventsBeta` — Microsoft is auto-migrating existing queries off those deprecated beta tables on **19 October 2026**, so both name sets may appear in older material). The data is largely the same — these are Defender XDR's view of the same underlying Entra sign-in stream — but **the column names are different**, and you can't paste a Sentinel query into Defender XDR's hunting console (or vice versa) without translation. Some of the most common mappings to keep in your head:
 >
 > | Sentinel / Log Analytics | Defender XDR |
 > |---|---|
@@ -86,7 +86,7 @@ Before the flows make sense, four ideas need to be solid.
 **Scopes and resources.** In v2 you pass `scopes` like `User.Read` or `https://graph.microsoft.com/.default`. The special `.default` scope means "give me everything this app is consented to for that resource" — it's what daemon apps use.
 
 **Tokens.**
-- *Access token* — JWT (in Entra) sent as `Authorization: Bearer ...` to APIs. Default ~60–90 min lifetime (Microsoft assigns a random value in that range, ~75 min average, to spread re-auth load). With CAE, the lifetime increases to up to **28 hours** but the token is revocable in near-real-time via claims challenges.
+- *Access token* — usually a JWT in Entra, sent as `Authorization: Bearer ...` to APIs. (Not always client-readable: some resources, notably certain Microsoft Graph tokens, receive tokens Entra encrypts/obscures for the resource, so the "paste it into jwt.ms" trick in §9 is resource-dependent — ARM/AAD-issued tokens decode cleanly, some Graph tokens won't.) Default ~60–90 min lifetime (Microsoft assigns a random value in that range, ~75 min average, to spread re-auth load). With CAE, the lifetime increases to up to **28 hours** but the token is revocable in near-real-time via claims challenges.
 - *ID token* — JWT for the *client* to read, never sent to APIs. Tells the app who signed in.
 - *Refresh token* — long-lived, used to get fresh access tokens silently. The thing attackers want most.
 
@@ -482,7 +482,7 @@ assertion = pyjwt.encode(
         "sub": CLIENT_ID,
         "jti": str(uuid.uuid4()),
         "nbf": now,
-        "exp": now + 600,    # 10 min — Entra's max accepted lifetime
+        "exp": now + 600,    # short-lived; MSAL uses ~10 min — keep it well under an hour
         "iat": now,
     },
     private_key,
@@ -506,7 +506,7 @@ The same `client_assertion` pattern works for confidential client auth-code rede
 
 ### What Entra logs
 
-Service principal sign-ins land in `AADServicePrincipalSignInLogs`, **not** `SignInLogs`. There's no user, no MFA, no Conditional Access (well, workload identity CA can apply with P2). The `servicePrincipalCredentialKeyId` field tells you *which* credential was used — invaluable for credential rotation and forensics.
+Service principal sign-ins land in `AADServicePrincipalSignInLogs`, **not** `SignInLogs`. There's no user, no MFA, no Conditional Access (well, CA for workload identities can apply — but that requires **Microsoft Entra Workload ID Premium**, a separate SKU that is *not* part of Entra ID P2; managed identities remain ineligible for CA entirely). The `servicePrincipalCredentialKeyId` field tells you *which* credential was used — invaluable for credential rotation and forensics.
 
 ```json
 {
@@ -735,7 +735,7 @@ while True:
 
 ### ROPC — DEPRECATED
 
-User hands their password to your app, your app sends it to Entra. Bypasses MFA, Conditional Access, federation, passwordless. Don't use it. Block it. The Microsoft identity platform deprecated this for public client flows; it'll be removed entirely.
+User hands their password to your app, your app sends it to Entra. It's *incompatible with* — not a bypass of — MFA, Conditional Access, federation, and passwordless: Conditional Access is still evaluated on a ROPC sign-in, and any policy requiring MFA, a compliant device, or passwordless simply makes ROPC **fail** rather than letting it through. It errors for federated and passwordless users too, and for some first-party apps Microsoft enforces MFA at the app-registration level so the token endpoint rejects ROPC before tenant CA is even evaluated. It only succeeds where plain password auth is still permitted — which is exactly why it's a credential-spray magnet. Don't use it. Block it. The Microsoft identity platform has deprecated this flow for public clients, and the mandatory-MFA rollout is progressively breaking it outright.
 
 ```python
 # Shown so you recognize it in old code; do not deploy this.
@@ -788,7 +788,7 @@ Log fingerprint: `AuthenticationProtocol == "ropc"`. Every hit is a ticket — c
 
 ### Implicit — DEPRECATED
 
-Old SPA flow: tokens delivered in URL fragment. Replaced by auth code + PKCE for SPAs. Tokens in URL fragments end up in browser history, referrer headers, JavaScript globals — every place tokens shouldn't be. If you see `AuthenticationProtocol == "oAuth2Implicit"` in your logs it's probably an old AngularJS app from 2018 — find it and migrate it.
+Old SPA flow: tokens delivered in URL fragment. Replaced by auth code + PKCE for SPAs. Tokens in URL fragments end up in browser history, referrer headers, JavaScript globals — every place tokens shouldn't be. Note there is **no** `AuthenticationProtocol == "oAuth2Implicit"` value — that string isn't part of the `signIn.authenticationProtocol` enum, so don't hunt for it. Implicit sign-ins surface as `oAuth2` (or, in the newer beta schema, one of the granular `implicitAccessTokenAnd…`/`implicitIdTokenAnd…ResponseMode` values). The more reliable fingerprint is a `response_type` of `token`/`id_token` on a legacy SPA app ID — find that app and migrate it.
 
 ### Hybrid (`response_type=code id_token`)
 
@@ -839,7 +839,7 @@ The fields you'll touch in 80% of queries:
 - `ResourceId`, `ResourceDisplayName` — the *resource* API the token targets.
 - `IPAddress`, `Location` — where the token request came from.
 - `ConditionalAccessStatus` — `success`, `failure`, `notApplied`, `disabled`.
-- `RiskLevelDuringSignIn`, `RiskState`, `RiskEventTypes_v2` — Identity Protection signals.
+- `RiskLevelDuringSignIn`, `RiskState`, `RiskEventTypes_V2` — Identity Protection signals.
 - `AuthenticationRequirement` — `singleFactorAuthentication` vs `multiFactorAuthentication`.
 - `AuthenticationProtocol` — flow identifier.
 - `IncomingTokenType` — what was traded in to get this token.
@@ -864,7 +864,7 @@ You should be able to look at a sign-in log row and immediately name the flow. C
 | `IncomingTokenType == "jwt"` + non-interactive + user present + appId is API not client | On-Behalf-Of |
 | `AuthenticationProtocol == "deviceCode"` | Device code |
 | `AuthenticationProtocol == "ropc"` | ROPC (investigate every hit) |
-| `AuthenticationProtocol == "oAuth2Implicit"` | Implicit (deprecated, find and migrate) |
+| `response_type` includes `token`/`id_token` on a legacy SPA app (no dedicated protocol string — `oAuth2` at most) | Implicit (deprecated, find and migrate) |
 | `AuthenticationProtocol` in (`"saml20"`, `"saml"`, `"wsFederation"`) | SAML / WS-Fed enterprise app SSO |
 
 > ### `AuthenticationProtocol` in practice: an important calibration
@@ -874,8 +874,9 @@ You should be able to look at a sign-in log row and immediately name the flow. C
 > - **OAuth-based flows** (auth code + PKCE, refresh, hybrid, OBO) frequently show `AuthenticationProtocol` as **`"none"`** (or empty/null) rather than `"oAuth2"`. OAuth/OIDC is Entra's implicit baseline, so the field often doesn't bother labeling it — you can't rely on `"oAuth2"` appearing.
 > - **Non-OAuth flows** (SAML, WS-Fed, device code, ROPC) are where the field is reliably populated, because that's what it exists to differentiate. You'll see `"saml20"` (sometimes `"saml"`), `"wsFederation"`, `"deviceCode"`, `"ropc"`.
 > - The Microsoft Graph schema reflects this asymmetry — there's a separate `authenticationProtocol` enum on the `samlOrWsFedProvider` resource type with only `wsFed`, `saml`, `unknownFutureValue` as values, no OAuth value at all. (That's the Graph-side schema for *configuring* federated IdPs — separate from the `AuthenticationProtocol` column in `SigninLogs` that we care about here.)
+> - **Watch the enum grow.** The *beta* `signIn` resource has recently sprouted much more granular values — `authorizationCodeWithPkce`, `refreshTokenGrant`, `clientCredentials`, `onBehalfOf`, `prtGrant`, and several `implicit…ResponseMode` members. If/when these start surfacing in your `SigninLogs.AuthenticationProtocol` column (they aren't reliably there yet), the "OAuth logs as none" assumption weakens — so re-run the calibration query below periodically rather than trusting a value you saw last year. Note that `oAuth2Implicit` is **not** and never was a member of this enum.
 >
-> **What this means for the cheatsheet above:** for the OAuth-family flows (auth code, refresh, OBO), do not filter on `AuthenticationProtocol`. Use `IncomingTokenType`, `ClientAppUsed`, `IsInteractive`, and `ResourceDisplayName` instead — these are populated consistently and they actually distinguish the flows. Only use `AuthenticationProtocol` as a positive filter for SAML, WS-Fed, device code, ROPC, and implicit, where it's the cleanest signal.
+> **What this means for the cheatsheet above:** for the OAuth-family flows (auth code, refresh, OBO), do not filter on `AuthenticationProtocol`. Use `IncomingTokenType`, `ClientAppUsed`, `IsInteractive`, and `ResourceDisplayName` instead — these are populated consistently and they actually distinguish the flows. Only use `AuthenticationProtocol` as a positive filter for SAML, WS-Fed, device code, and ROPC, where it's the cleanest signal.
 >
 > The JSON examples in Part I (§§2–5) reflect this: OAuth-family flows show `"AuthenticationProtocol": "none"`, and the non-OAuth flows show their respective values (`"deviceCode"`, `"ropc"`, `"saml20"`, etc.). All field names in those samples use the Log Analytics column-name format (PascalCase) so you can copy any field directly into a KQL query — see the data-source note at the top of the guide for the corresponding Defender XDR field names.
 
@@ -891,7 +892,7 @@ union SigninLogs, AADNonInteractiveUserSignInLogs, AADServicePrincipalSignInLogs
 | sort by Count desc
 ```
 
-Run this on day one of any new role. Most rows will land in `Protocol == "none"` + `Incoming == "none"` (OAuth fresh auth) or `Protocol == "none"` + `Incoming == "primaryRefreshToken"` (OAuth refresh). The interesting tails are everything else — `"saml20"`, `"deviceCode"`, `"ropc"`, `"oAuth2Implicit"`, or any value you don't recognize. Investigate the tails.
+Run this on day one of any new role. Most rows will land in `Protocol == "none"` + `Incoming == "none"` (OAuth fresh auth) or `Protocol == "none"` + `Incoming == "primaryRefreshToken"` (OAuth refresh). The interesting tails are everything else — `"saml20"`, `"deviceCode"`, `"ropc"`, `"wsFederation"`, or any value you don't recognize. Investigate the tails.
 
 The HTTP each flow generates — and the log row each call produces — is covered in detail in Part I (§§2–5). If a fingerprint above is unfamiliar, jump back: every `IncomingTokenType` value maps to a specific request shape there.
 
@@ -931,11 +932,11 @@ CAE is one of those features where the marketing description ("real-time token r
 
 ### How CAE actually works
 
-The core trade-off CAE makes: instead of issuing short-lived (~75 minute) access tokens that clients constantly renew, Entra issues **long-lived tokens** — up to **28 hours** for users, **24 hours** for workload identities — that the resource API can **reject mid-flight** when something changes. Fewer token round-trips, near-real-time revocation, better resilience and security at once. (For workload identities specifically, *managed identities aren't supported* for CAE — only service principals for line-of-business apps. That's a real gap.)
+The core trade-off CAE makes: instead of issuing short-lived (~75 minute) access tokens that clients constantly renew, Entra issues **long-lived tokens** — up to **28 hours** for users (the workload-identity figure is often quoted around 24 hours, but verify against current CAE docs before relying on it) — that the resource API can **reject mid-flight** when something changes. Fewer token round-trips, near-real-time revocation, better resilience and security at once. (For workload identities specifically, *managed identities aren't supported* for CAE — only service principals for line-of-business apps. That's a real gap.)
 
 The negotiation has three required parties:
 
-**1. The resource API has to be CAE-enabled.** Microsoft has rolled this out gradually since 2020 — Microsoft Graph, Exchange Online, SharePoint Online, Teams, ARM. Custom APIs you build don't get CAE unless you implement the protocol on the resource side, which almost no one has. Storage data plane and Key Vault data plane are not CAE-enabled. This is the gotcha most people miss: CAE isn't a tenant setting that just turns on for everything.
+**1. The resource API has to be CAE-enabled.** Microsoft has rolled this out gradually since 2020 — Microsoft Graph, Exchange Online, SharePoint Online, Teams, ARM — and the list keeps growing (Azure DevOps in 2025, Power Platform in 2026), so re-check current coverage rather than trusting a static list. Custom APIs you build don't get CAE unless you implement the protocol on the resource side, which almost no one has. Storage data plane and Key Vault data plane are (as of writing) not CAE-enabled. This is the gotcha most people miss: CAE isn't a tenant setting that just turns on for everything.
 
 **2. The client has to declare `cp1` in its client capabilities.** This is a string the app sends in the token request that means "I understand the claims challenge protocol, you can give me a long-lived token, I'll handle 401 responses correctly." MSAL libraries set this automatically when configured to. The authoritative way to verify a token is CAE-capable is to check for `"xms_cc": ["CP1"]` in the issued access token's claims.
 
@@ -1057,7 +1058,7 @@ The ones most often abused in incident response. The "FOCI" column reflects the 
 |---|---|---|---|
 | `04b07795-8ddb-461a-bbee-02f9e1bf7b46` | Microsoft Azure CLI | Yes | Pre-consented to ARM + Graph |
 | `1950a258-227b-4e31-a9cf-717495945fc2` | Microsoft Azure PowerShell | Yes | ARM + Graph |
-| `1b730954-1685-4b74-9bfd-dac224a7b894` | Azure AD PowerShell (legacy) | No | Directory access (deprecated module but still works) |
+| `1b730954-1685-4b74-9bfd-dac224a7b894` | Azure AD PowerShell (legacy) | No | Directory access (module retired with Azure AD Graph ~Oct 2025 — the client ID still resolves, but directory calls now fail) |
 | `14d82eec-204b-4c2f-b7e8-296a70dab67e` | Microsoft Graph Command Line Tools | No (unconfirmed) | Default app for `Connect-MgGraph`, broad Graph scopes |
 | `d3590ed6-52b3-4102-aeff-aad2292ab01c` | Microsoft Office | Yes | Mailbox + files |
 | `1fec8e78-bce4-4aaf-ab1b-5451cc387264` | Microsoft Teams | Yes | Teams + Graph |
@@ -1359,7 +1360,7 @@ UrlClickEvents
 | extend RedirectUri = url_decode(extract(@"redirect_uri=([^&]+)", 1, QueryParams))
 | project Timestamp, AccountUpn, Workload, ClientId, Scope, RedirectUri, ActionType, IsClickedThrough
 | where Scope has_any ("Mail.Read", "Files.Read", "offline_access", "Directory.Read")
-   or RedirectUri !has "microsoft" and RedirectUri !has "office" 
+   or (RedirectUri !has "microsoft" and RedirectUri !has "office")
 | sort by Timestamp desc
 ```
 
@@ -1380,7 +1381,8 @@ suspicious_consents
     | where Timestamp > ago(24h)
     | where Url has "login.microsoftonline.com"
 ) on $left.Initiator == $right.AccountUpn
-| where ClickTime = Timestamp, ClickTime between (ConsentTime - 30m .. ConsentTime + 5m)
+| extend ClickTime = Timestamp
+| where ClickTime between (ConsentTime - 30m .. ConsentTime + 5m)
 | project ClickTime, ConsentTime, AccountUpn = Initiator, AppName, Url, 
           ActionType, IsClickedThrough, NetworkMessageId, ThreatTypes
 ```
@@ -1487,7 +1489,7 @@ sharepoint = mint_access_token_for("https://contoso.sharepoint.com/.default")
 
 For the defender: each of those `mint_access_token_for` calls is **one row** in `AADNonInteractiveUserSignInLogs`, with `IncomingTokenType: "primaryRefreshToken"` or `"refreshToken"`, the same `AppId`, but a *different* `ResourceDisplayName` per call. This is the fingerprint of post-compromise activity — one RT, many resources, often within minutes.
 
-The hunt query that catches it most reliably is "RT redeeming for a resource the user/app has never used before" (see H4 in §11). The IP on these rows is the **attacker's** — the user is asleep. This is why correlating IP across `SigninLogs` (the original interactive sign-in, user's IP) and `AADNonInteractiveUserSignInLogs` (subsequent RT redemptions, possibly attacker's IP) is so high-signal.
+The hunt query that catches it most reliably is "RT redeeming for a resource the user/app has never used before" (see H4 in §15). The IP on these rows is the **attacker's** — the user is asleep. This is why correlating IP across `SigninLogs` (the original interactive sign-in, user's IP) and `AADNonInteractiveUserSignInLogs` (subsequent RT redemptions, possibly attacker's IP) is so high-signal.
 
 **Mitigations across all three:**
 
@@ -1572,7 +1574,7 @@ resp = requests.post(
 ).json()
 ```
 
-This is the attack the D1 detection (newly-added app credentials) is designed to catch. The Graph call to `/addPassword` produces the audit log row; the subsequent client-credentials token request produces a sign-in log row with a fresh `servicePrincipalCredentialKeyId` you've never seen before. Joining the two on appId + time window is the high-fidelity finding.
+This is the attack the "new credentials added to existing apps" detection below is designed to catch. The Graph call to `/addPassword` produces the audit log row; the subsequent client-credentials token request produces a sign-in log row with a fresh `servicePrincipalCredentialKeyId` you've never seen before. Joining the two on appId + time window is the high-fidelity finding.
 
 ### Detection: new credentials added to existing apps
 
@@ -2013,7 +2015,7 @@ The investigative goal in the first 10 minutes: **a complete timeline from inbou
     Revoke-MgUserSignInSession -UserId <upn>
     ```
 
-    This invalidates refresh tokens. **It does not, by itself, instantly kill access tokens already issued** — but what happens next depends on CAE (§9). Revoking sessions fires a CAE revocation event: for **CAE-eligible** app/resource pairs the resource rejects the stale access token near-real-time (~15 min propagation), so containment is fast. For **non-CAE** pairs there's no revocation channel — the already-minted access token lives until natural expiry (≤~1 hour). Plan accordingly: against non-CAE resources the attacker may still have up to ~1h of access after you revoke.
+    This invalidates refresh tokens. **It does not, by itself, instantly kill access tokens already issued** — but what happens next depends on CAE (§9). Revoking sessions fires a CAE revocation event: for **CAE-eligible** app/resource pairs the resource rejects the stale access token near-real-time (~15 min propagation), so containment is fast. For **non-CAE** pairs there's no revocation channel — the already-minted access token lives until natural expiry (the standard ~60–90 min token lifetime from §1). Plan accordingly: against non-CAE resources the attacker may still have up to ~90 min of access after you revoke.
 
 8. **Quarantine the source emails.** Defender → Threat Explorer → submit the `NetworkMessageId`s for soft delete or hard delete (depending on your policy). Use ZAP (Zero-hour Auto Purge) if available. This removes them from inboxes that haven't been read yet.
 
@@ -2083,7 +2085,7 @@ The investigative goal in the first 10 minutes: **a complete timeline from inbou
 2. **Revoke all sessions.**
 3. **Audit all changes the account made** in `AuditLogs` over the suspect window — apps registered, consents granted, role assignments, policy changes.
 4. **Reverse the changes.** Every app the account registered → review and likely delete. Every consent granted → revoke. Every role assignment → reverse.
-5. **Audit credential additions to existing apps** (the persistence move from §9). Reverse those.
+5. **Audit credential additions to existing apps** (the persistence move from §13). Reverse those.
 6. **Check break-glass accounts.** If those have been touched, treat as tenant compromise.
 7. **Review CA policy modifications** — any new exclusions, disabled policies, weakened conditions need to be reverted.
 
@@ -2117,8 +2119,8 @@ The minimum-viable Entra hardening, in approximate order of impact-to-effort:
 17. Audit and disable stale guest accounts.
 
 **Continuous:**
-- All detections in §10 wired to your SIEM.
-- The hunt queries in §11 run weekly with someone reviewing.
+- All detections in §14 wired to your SIEM.
+- The hunt queries in §15 run weekly with someone reviewing.
 - Sign-in log volume monitored — sudden spikes from an app or user are themselves a signal.
 - Quarterly privilege review and red-team exercise focused on the consent-grant attack path specifically.
 
@@ -2235,9 +2237,9 @@ For both of those, you still need the supporting signals — IP, ASN, user agent
 
 A few practical implications for the detections elsewhere in this guide:
 
-- The §4 Azure Portal worked example — those 20+ log rows for one user click — share one `SessionId` if the user authenticated once and stayed in CAE-bound territory. Replace your old "join on UPN + time window" with `SessionId` for cleaner reconstructions.
-- §6 OAuth phishing investigation: when triaging a `Consent to application` audit event, you currently can't pivot back to a session via SID (audit logs don't carry it yet). Pivot via UPN + time window to the `SigninLogs` row that preceded the consent, then use *that* row's `SessionId` to chase what the malicious app did with its newly-acquired tokens.
-- §13 incident response runbook for compromised account: after revoking sessions, use the SID of the suspect sign-in to enumerate exactly what happened during it. This is where LTI most cleanly closes a gap that used to take hours of correlation work.
+- The §8 Azure Portal worked example — those 20+ log rows for one user click — share one `SessionId` if the user authenticated once and stayed in CAE-bound territory. Replace your old "join on UPN + time window" with `SessionId` for cleaner reconstructions.
+- §11 OAuth phishing investigation: when triaging a `Consent to application` audit event, you currently can't pivot back to a session via SID (audit logs don't carry it yet). Pivot via UPN + time window to the `SigninLogs` row that preceded the consent, then use *that* row's `SessionId` to chase what the malicious app did with its newly-acquired tokens.
+- §17 incident response runbook for compromised account: after revoking sessions, use the SID of the suspect sign-in to enumerate exactly what happened during it. This is where LTI most cleanly closes a gap that used to take hours of correlation work.
 
 ---
 
@@ -2251,9 +2253,11 @@ There are two Graph endpoints, and therefore two activity log tables.
 
 **`graph.microsoft.com` — Microsoft Graph.** The modern, supported, actively-developed API. Everything Microsoft has built since ~2017 lives here: M365 services, Azure AD/Entra management, Defender XDR, Teams, Intune. New features ship here first and often only here. Modern SDKs (`Microsoft.Graph` PowerShell, `microsoft-graph-sdk-python`, the `@azure/msal-*` JS libraries) all target this endpoint.
 
-**`graph.windows.net` — Azure AD Graph (AAD Graph).** The legacy API. Microsoft has been deprecating it since 2019 — but it still works, and that "still works" is the problem. The classic `AzureAD` and `MSOnline` PowerShell modules talk to AAD Graph directly. Some older SaaS integrations still call it. Some Microsoft-internal tools historically called it. And — crucially — for years it had **no per-request audit logging**. Attackers learned this. AAD Graph became the defender's blind spot, and red-team tooling like ROADrecon explicitly preferred it because of that.
+**`graph.windows.net` — Azure AD Graph (AAD Graph).** The legacy API — now *retired*. Microsoft deprecated it back in 2019, but for years it kept working, and that longevity was the problem. The classic `AzureAD` and `MSOnline` PowerShell modules talked to AAD Graph directly; some older SaaS integrations called it; some Microsoft-internal tools historically did too. And — crucially — for years it had **no per-request audit logging**. Attackers learned this: AAD Graph was a defender blind spot, and red-team tooling like ROADrecon preferred it precisely because of that.
 
-That changed in late 2025: `AADGraphActivityLogs` started flowing into Log Analytics workspaces that had enabled the diagnostic setting. Many tenants enabled it in May 2025 and saw nothing for ~6 months — then suddenly data appeared. If you enabled this and never came back to check, **check now**, because attacks that were invisible during the gap are visible going forward.
+Microsoft finally executed the retirement in 2025: apps were blocked from calling AAD Graph starting **February 1, 2025** (rolling out through February), tenants could opt individual apps into **extended access until June 30, 2025**, the protocol was fully shut down in **early September 2025**, and the `AzureAD`/`MSOnline` PowerShell modules stopped functioning around **mid-October 2025**. So the "it still works" era is over — the endpoint should be dead in your tenant today, and any *successful* AAD Graph call now is itself worth investigating as a legacy holdout or misconfiguration.
+
+The reason it's still in this guide is the audit data that arrived just before the lights went out: `AADGraphActivityLogs` started flowing into Log Analytics workspaces that had enabled the diagnostic setting in late 2025. Many tenants enabled it in May 2025 and saw nothing for ~6 months — then data suddenly appeared. If you enabled this and never came back to check, **check now**: it's your window into what was happening over AAD Graph during the pre-retirement period (and any extended-access holdouts), a stretch that was otherwise invisible.
 
 ### The two log tables
 
@@ -2262,8 +2266,8 @@ Both tables capture the same conceptual thing — an HTTP request to Graph — b
 | Aspect | `MicrosoftGraphActivityLogs` | `AADGraphActivityLogs` |
 |---|---|---|
 | Endpoint | `graph.microsoft.com` | `graph.windows.net` |
-| Status | Modern, GA since April 2024 (preview 2023) | Legacy, data flowing since late 2025 |
-| Volume | Very high — every Graph SDK call lands here | Lower (and shrinking as apps migrate), but high per-attacker-tool because legacy attacker tooling concentrates here |
+| Status | Modern, GA since April 2024 (preview 2023) | Legacy; endpoint retired 2025, log data flowing since late 2025 (historical/forensic value) |
+| Volume | Very high — every Graph SDK call lands here | Now near-zero going forward (endpoint retired); the value is the pre-retirement backlog, where legacy attacker tooling concentrated |
 | Caller IP field | `IPAddress` | `CallerIpAddress` |
 | App identifier | `AppId` | `AppId` |
 | User identifier | `UserId` | `UserId` |
@@ -2385,7 +2389,6 @@ union
 | extend NormalizedPath = tolower(replace_string(replace_string(
     tostring(parse_url(RequestUri).Path), "v1.0/", ""), "beta/", ""))
 | where NormalizedPath has_any (recon_paths)
-| extend HitPath = tostring(array_iff(NormalizedPath has_any (recon_paths), NormalizedPath, ""))
 | summarize DistinctPaths = dcount(NormalizedPath),
             PathList = make_set(NormalizedPath, 20),
             CallCount = count(),
